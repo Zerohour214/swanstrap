@@ -63,7 +63,7 @@ sudo ./swanstrap/bootstrap.sh --quick
 
 ---
 
-## 2. Key ideas in plain words
+## 2. Definitions
 
 | Term | What it means here |
 |---|---|
