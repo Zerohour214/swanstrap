@@ -7,7 +7,7 @@ bad=$(echo "$files" |
   grep -v '^config\.example\.env$')
 # Content: unencrypted private keys, or real (not template) strongSwan secrets
 for f in $(echo "$files" | grep -v '^ca/pq-vpn-root-ca\.key\.enc$'); do
-  git show ":$f" 2>/dev/null | grep -qE -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|secret = "[^"%$]{6,}"' && bad="$bad
+  git show ":$f" 2>/dev/null | grep -qE -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|secret = "[^"%$<][^"]{5,}"' && bad="$bad
 $f (private key or password inside)"
 done
 bad=$(echo "$bad" | sed '/^$/d')
