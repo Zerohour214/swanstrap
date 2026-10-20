@@ -288,7 +288,7 @@ charon chooses the connection during IKE_AUTH: if the client omits the AUTH payl
 | Client IPv4 pool | `10.20.N.0/24`, N = 20, 21, … per server | `10.20.20.0/24` |
 | Client IPv6 pool | `fd20:A:B::/64` derived from pool `10.A.B.0/24` (ULA) | `fd20:20:20::/64` |
 | Client DNS | `DNS` setting | `1.1.1.1, 9.9.9.9` |
-| Egress | SNAT (MASQUERADE) to the uplink address | `enp0s6` → `198.51.100.10` |
+| Egress | SNAT (MASQUERADE) to the uplink address | `eth0` → `198.51.100.10` |
 
 Pools are unique across servers (inventory) and are checked against local routes, so they don't collide with VPC or Docker ranges.
 
