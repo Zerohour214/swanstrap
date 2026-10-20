@@ -31,7 +31,7 @@ sudo ./swanstrap/bootstrap.sh --quick
 
 ---
 
-## 1. The big picture
+## 1. Flow
 
 ```
    ┌──────────────────────────────┐
