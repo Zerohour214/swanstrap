@@ -40,8 +40,8 @@ uuid() { cat /proc/sys/kernel/random/uuid; }
 unlock_ca() {
   [ -f $CA/pq-vpn-root-ca.key.enc ] || die "CA key not on this server; run this on the CA server"
   TMP=$(mktemp -d /run/swanstrap.XXXXXX); trap 'find "$TMP" -type f -exec shred -u {} +; rm -rf "$TMP"' EXIT
-  read -rsp "CA passphrase: " CAPW; echo
-  openssl pkey -in $CA/pq-vpn-root-ca.key.enc -passin "pass:$CAPW" -out "$TMP/ca.key" 2>/dev/null || die "wrong CA passphrase"
+  read -rsp "CA passphrase: " CAPW; echo; export CAPW   # openssl reads it via env:, never argv
+  openssl pkey -in $CA/pq-vpn-root-ca.key.enc -passin env:CAPW -out "$TMP/ca.key" 2>/dev/null || die "wrong CA passphrase"
 }
 
 # Windows installer. Uses: LOGIN (eap|cert), CA_B64, P12_B64
@@ -202,10 +202,10 @@ add-device)
   pki --req --type priv --in "$TMP/client.key" --dn "O=PQ-VPN, OU=device, CN=$NAME@pqvpn" --san "$NAME@pqvpn" --outform pem |
     pki --issue --cacert $CACRT --cakey "$TMP/ca.key" --type pkcs10 --not-before "$(not_before)" --lifetime "$DAYS" \
       --flag clientAuth --outform pem > "$ISSUED"
-  pw=$(openssl rand -base64 12 | tr -d '/+=')
+  pw=$(openssl rand -base64 12 | tr -d '/+='); export P12PW=$pw
   # 3DES/SHA1 PKCS#12 encoding: the most widely accepted by Windows and iOS importers
   P12_B64=$(openssl pkcs12 -export -inkey "$TMP/client.key" -in "$ISSUED" -certfile $CACRT -name "PQ-VPN $NAME" \
-    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -passout "pass:$pw" | base64 -w0)
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -passout env:P12PW | base64 -w0)
   LOGIN=cert; LOGIN_DESC="certificate login ($NAME)"
   mkdir -p "$OUT/devices"
   if [ "$TYPE" = windows ]; then file=$OUT/devices/$NAME-$DIR.ps1; windows_ps1 > "$file"

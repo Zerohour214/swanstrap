@@ -230,8 +230,8 @@ read_pass() { if [ -n "$PASSFILE" ]; then head -n1 "$PASSFILE"; else read -rsp "
 if [ "$CA_MODE" = restore ]; then
   [ -n "$PASSFILE" ] || [ -t 0 ] || die "restoring the CA needs its passphrase: run in a terminal or use --ca-passphrase-file"
   for try in 1 2 3; do
-    CAPW=$(read_pass "CA passphrase: ")
-    openssl pkey -in "$KCA/pq-vpn-root-ca.key.enc" -passin "pass:$CAPW" -out "$TMP/ca.key" 2>/dev/null && break
+    CAPW=$(read_pass "CA passphrase: "); export CAPW   # openssl reads it via env:, never argv
+    openssl pkey -in "$KCA/pq-vpn-root-ca.key.enc" -passin env:CAPW -out "$TMP/ca.key" 2>/dev/null && break
     [ -n "$PASSFILE" ] || [ $try = 3 ] && die "wrong CA passphrase (nothing was changed except base packages)"
     echo "wrong passphrase, try again"
   done
@@ -247,6 +247,7 @@ else
     done
   fi
   [ ${#CAPW} -ge 12 ] || die "CA passphrase must be at least 12 characters"
+  export CAPW
 fi
 
 # --- 3. strongSwan with ML-KEM (also provides 'pki' for certificates) ------------------------------
@@ -265,7 +266,7 @@ install -m 600 "$TMP/ca.crt" $CA/pq-vpn-root-ca.crt
 if [ "$CA_MODE" = restore ]; then   # keep the kit's file byte-identical (re-encrypting changes it)
   install -m 600 "$KCA/pq-vpn-root-ca.key.enc" $CA/pq-vpn-root-ca.key.enc
 else
-  openssl pkey -in "$TMP/ca.key" -aes256 -passout "pass:$CAPW" -out $CA/pq-vpn-root-ca.key.enc
+  openssl pkey -in "$TMP/ca.key" -aes256 -passout env:CAPW -out $CA/pq-vpn-root-ca.key.enc
 fi
 inv_upsert "$INV" "$SERVER_ID" "$SERVER_NAME" "$PROVIDER" "$COUNTRY" "$CITY" "$REGION" "$SERVER_ADDR" "$POOL"
 install -m 600 "$INV" $CA/servers.tsv
