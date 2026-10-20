@@ -44,6 +44,8 @@ SSH into the server and run:
 # 1. Get the kit (password prompt = paste your GitHub token)
 sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/Zerohour214/swanstrap.git
+git config --global user.name  "Your Name"                                     # needed to save
+git config --global user.email "<id>+<username>@users.noreply.github.com"      # (step 4)
 
 # 2. Preview what will happen (changes nothing)
 ./swanstrap/bootstrap.sh --quick --dry-run
@@ -52,13 +54,16 @@ git clone https://github.com/Zerohour214/swanstrap.git
 sudo ./swanstrap/bootstrap.sh --quick
 #    first time / no passphrase:  sudo ./swanstrap/bootstrap.sh --quick --new-ca
 
-# 4. Save the result back to GitHub
-cd swanstrap && git add ca && git commit -m "Bootstrap $(hostname)" && git push
+# 4. Save the result back to GitHub (asks for your GitHub token)
+sudo swanstrap sync-kit ~/swanstrap --push
 ```
 
 Step 3 takes **2–15 minutes**. It detects the provider, location and IP, installs strongSwan with post-quantum
 support, sets up the server's own firewall, and creates a login called **`personal`**.
 When it finishes it prints the server's name (for example **OCI-PQ Singapore**).
+
+> Your GitHub no-reply email is under GitHub → Settings → Emails. To skip the token prompt next time:
+> `git config --global credential.helper store` (stores the token in plain text on the server).
 
 > With `--new-ca` it prints a **NEW CA PASSPHRASE**. Write it down now; see [section 8](#8-keep-these-safe).
 
@@ -149,7 +154,7 @@ Use the free **strongSwan VPN Client** app (Google Play / F-Droid). Builds based
 ### Linux (post-quantum, strongSwan 6)
 
 ```bash
-sudo apt-get install -y strongswan-swanctl charon-systemd    # needs strongSwan >= 6.0
+sudo apt-get install -y strongswan-swanctl charon-systemd libcharon-extra-plugins   # strongSwan >= 6.0; extra-plugins = EAP login
 sudo cp pq-vpn-root-ca.crt /etc/swanctl/x509ca/              # from this repo's ca/ folder
 sudo tee /etc/swanctl/conf.d/swanstrap.conf >/dev/null <<'EOF'
 connections {
@@ -177,12 +182,17 @@ connections {
 secrets {
   eap-personal {
     id = personal
+    id-server = <server-ip>        # ties this password to this server (needed with several servers)
     secret = "<your password>"
   }
 }
 EOF
 sudo swanctl --load-all && sudo swanctl --initiate --child swanstrap
+sudo swanctl --list-sas            # look for CURVE_25519/KE1_ML_KEM_768 = post-quantum
 ```
+
+More servers: add one `.conf` per server with its own connection/child name (e.g. `frankfurt`) and its own
+`eap-…` secret block with that server's IP as `id-server` (each server has its own `personal` password).
 
 > **Which devices get post-quantum?** Linux and Android with strongSwan 6. The VPN built into **Windows,
 > iPhone and Mac** doesn't support ML-KEM yet; those devices use strong classical encryption (AES-256-GCM, ECP-384).
@@ -219,7 +229,7 @@ different channels.
 | `CREDENTIALS.txt` | Contains your passwords | Copy to your password manager, then **delete it on the server**: `rm ~/vpn-clients/CREDENTIALS.txt` |
 
 After adding servers or devices, save the CA and inventory to GitHub:
-`sudo swanstrap sync-kit ~/swanstrap && cd ~/swanstrap && git add ca && git commit -m update && git push`
+`sudo swanstrap sync-kit ~/swanstrap --push` (commits only if something changed).
 
 ## 9. Quick fixes
 
@@ -231,6 +241,8 @@ After adding servers or devices, save the CA and inventory to GitHub:
 | Wrong username / password | Username is `personal` (or the name you used); password in `CREDENTIALS.txt` |
 | Connected, but no internet | On the server: `sudo systemctl restart swanstrap-firewall` |
 | Stopped working after the server restarted | The public IP changed; reserve a static IP, then see [Operations](#24-operations) |
+| Linux client: `EAP_IDENTITY not supported` | `sudo apt-get install -y libcharon-extra-plugins`, then restart strongSwan |
+| `sync-kit --push` says git has no identity | Run the two `git config --global` lines from [step 2](#2-set-up-the-server) |
 | `bootstrap.sh` says "kernel lacks IPsec support" | The VPS is OpenVZ/LXC; use a KVM VPS |
 | `bootstrap.sh` says "wrong CA passphrase" | Retry. If lost: `--new-ca` |
 
@@ -349,6 +361,11 @@ More: [Troubleshooting (technical)](#25-troubleshooting).
 | Debian 12 + ufw active | source | `ml` plugin |
 | Fedora 40 | refused in preflight | n/a |
 
+**End-to-end** (3 containers on one network, every Part 1 command run as written): a Linux strongSwan 6.0.4 client
+connected to a CA server (source 6.1.0) and a member server (distro 6.0.4) at the same time. Both negotiated
+`CURVE_25519/KE1_ML_KEM_768` with EAP-MSCHAPv2 login and IPv4 + IPv6 virtual IPs; traffic was NAT'd out and client
+IPv6 was refused through the tunnel. Generated `.ps1` files pass the PowerShell parser; `.mobileconfig` files parse as plists.
+
 ### Clients
 
 | Client | KE negotiated | IKE / ESP | Auth |
@@ -387,7 +404,7 @@ Windows and Apple native IKEv2 stacks don't implement RFC 9370 / ML-KEM; they ge
 | `ca/` expired, `auto` | New CA (noted in the output). `restore` aborts. |
 | `ca/` < 1 year left | Warning |
 | `ca/` unreadable | Abort. Never silently treated as expired. |
-| `--new-ca` | New RSA-4096 root. The old `ca/` is moved to `ca.old-<ts>/`. Passphrase: prompted twice (guided), `--ca-passphrase-file`, or generated (`--quick`, printed once and written to `CREDENTIALS.txt`). |
+| `--new-ca` | New RSA-4096 root, overwriting `ca/` (the old CA stays in git history). Passphrase: prompted twice (guided), `--ca-passphrase-file`, or generated (`--quick`, printed once and written to `CREDENTIALS.txt`). |
 
 ### strongSwan acquisition (`STRONGSWAN=auto`)
 
@@ -496,7 +513,7 @@ mangle FORWARD  -d $POOL        -m policy --dir out --pol ipsec -p tcp --tcp-fla
 | Server has global IPv6 + default route | Rules |
 |---|---|
 | Yes | ip6tables FORWARD policy accepts for `$POOL6` + NAT66 MASQUERADE out the v6 uplink; `net.ipv6.conf.all.forwarding=1` and `accept_ra=2` on the uplink (otherwise enabling forwarding drops SLAAC/RA routes) |
-| No | `ip6tables -I FORWARD 1 -s $POOL6 -j REJECT --reject-with icmp6-adm-prohibited`. Clients receive a v6 address, so IPv6 can't leak around the tunnel; the immediate reject makes Happy Eyeballs fall back to IPv4 |
+| No | IPv6 forwarding stays enabled (`accept_ra=2`) and `$POOL6` is routed to the uplink, so the kernel answers client IPv6 immediately with ICMPv6 *unreachable* (≈5 ms, verified), sent back through the tunnel; `ip6tables -I FORWARD 1 -s $POOL6 -j REJECT --reject-with icmp6-adm-prohibited` is the backstop. Clients receive a v6 address, so IPv6 can't leak around the tunnel, and apps fall back to IPv4 at once |
 
 **ufw mode** (ufw active): the same rules go into `/etc/ufw/before.rules` / `before6.rules` (`*nat` / `*mangle` blocks at the top,
 `ufw-before-forward` / `ufw6-before-forward` rules after `# End required lines`), between `# swanstrap BEGIN/END <tag>`
@@ -539,7 +556,7 @@ ssh ubuntu@203.0.113.20 'tar xf swanstrap-aws-de-fra-01.tar && sudo ./swanstrap/
 # open UDP 500/4500 at that provider (Part 1, step 3)
 
 rm ~/vpn-clients/AWS-PQ-Frankfurt/swanstrap-aws-de-fra-01.tar          # the bundle holds a private key
-sudo swanstrap sync-kit ~/swanstrap && (cd ~/swanstrap && git add ca && git commit -m "Add aws-de-fra-01" && git push)
+sudo swanstrap sync-kit ~/swanstrap --push
 ```
 
 | Concern | Behaviour |
@@ -561,7 +578,7 @@ sudo swanstrap sync-kit ~/swanstrap && (cd ~/swanstrap && git add ca && git comm
 | `remove <name>` | any | Delete a user (`swanctl --load-creds --clear`) or a device record + artifacts on all servers. The cert stays valid until expiry |
 | `list` | any | Inventory, users, devices with expiry, active IKE SAs |
 | `add-server <id> <City> <region> <ipv4>` | CA | Register, allocate a pool, sign, build the bundle |
-| `sync-kit <repo-dir>` | CA | Copy `/root/vpn-ca/{crt,key.enc,servers.tsv}` into `<repo>/ca/` |
+| `sync-kit <repo-dir> [--push]` | CA | Copy `/root/vpn-ca/{crt,key.enc,servers.tsv}` into `<repo>/ca/`. `--push`: commit (only if changed) and push as the repo owner, with their git identity and credentials |
 | `upgrade-strongswan` | any | Source: rebuild the latest 6.x; package: `apt --only-upgrade`. Then restart and verify ML-KEM |
 | `firewall` | any | Uplink / IPv6 / ufw state and the relevant rules |
 
@@ -659,13 +676,13 @@ Services: `strongswan` (or `strongswan-swanctl` with distro packages; detected) 
 | Reload config / creds | `sudo swanctl --load-all` (no SA teardown) |
 | Kick a session | `sudo swanctl --terminate --ike-id <id>` |
 | Verify PQ is offered | `sudo swanctl --list-algs \| grep ML_KEM` |
-| Verify a PQ SA | `sudo swanctl --list-sas`: the IKE SA's key exchange line lists ML-KEM-768 in addition to X25519 |
+| Verify a PQ SA | `sudo swanctl --list-sas`: the IKE SA shows `AES_GCM_16-256/PRF_HMAC_SHA2_384/CURVE_25519/KE1_ML_KEM_768` |
 | Upgrade strongSwan | `sudo swanstrap upgrade-strongswan` |
 | Re-apply the firewall | `sudo systemctl restart swanstrap-firewall` |
 | Public IP changed | CA server: `sudo ./bootstrap.sh --quick --id <id>` (reissues the cert for the new IP). Member: `add-server` again. Then re-render artifacts (`add-user`) |
 | Leaf certs expiring | The login banner warns 60 days ahead. Re-run bootstrap / add-server (servers); issue new device certs |
 | Root CA rotation | `bootstrap.sh --new-ca`; redeploy artifacts to every client; rebuild member servers |
-| Keep the repo authoritative | `sudo swanstrap sync-kit ~/swanstrap`, then commit and push after `add-server` / `add-device` |
+| Keep the repo authoritative | `sudo swanstrap sync-kit ~/swanstrap --push` after `bootstrap` / `add-server` |
 
 ## 25. Troubleshooting
 
