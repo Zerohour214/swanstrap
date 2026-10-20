@@ -283,9 +283,7 @@ render_conf "$KIT/templates/pq-vpn.conf.tmpl" "$SITE/pq-vpn.conf"
 
 # --- 5. save the CA + inventory back into the kit ----------------------------------------------------
 OWNER=$(stat -c %U "$KIT")
-if [ "$CA_MODE" = new ] && [ -f "$KCA/pq-vpn-root-ca.crt" ]; then
-  mv "$KCA" "$KIT/ca.old-$(date +%Y%m%d%H%M%S)"     # keep the replaced CA (still in git history too)
-fi
+# A new CA simply overwrites ca/: the replaced CA stays recoverable from git history
 install -d -o "$OWNER" "$KCA"
 install -m 644 -o "$OWNER" $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc $CA/servers.tsv "$KCA/"
 [ -d "$KIT/.git" ] && runuser -u "$OWNER" -- git -C "$KIT" config core.hooksPath hooks
@@ -309,7 +307,7 @@ fi
 cat <<EOF
 
   Save the CA (encrypted) + inventory to your repo:
-    cd $KIT && git add ca && git commit -m "Bootstrap $SERVER_ID" && git push
+    sudo swanstrap sync-kit $KIT --push
 
   Then download your login files:  scp -r $CLIENT_USER@$SERVER_ADDR:~/vpn-clients .
 EOF

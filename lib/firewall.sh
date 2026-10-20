@@ -16,16 +16,26 @@ HAS_V6=0
 ufw_active() { command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; }
 
 sysctls() {
+  local ra_if=${IF6:-$IF}
   {
     echo "net.ipv4.ip_forward = 1"
-    if [ $HAS_V6 = 1 ]; then
-      # Forwarding makes Linux ignore router advertisements unless accept_ra = 2;
-      # without this the server could lose its own IPv6 default route.
-      echo "net.ipv6.conf.$IF6.accept_ra = 2"
+    # IPv6 forwarding is needed either way: with an IPv6 uplink to route client traffic,
+    # without one so the kernel refuses client IPv6 at once (ICMPv6 unreachable) instead
+    # of silently dropping it (slow app timeouts). Forwarding makes Linux ignore router
+    # advertisements unless accept_ra = 2, so keep the server's own IPv6 config working.
+    if [ -d /proc/sys/net/ipv6 ]; then
+      [ -e "/proc/sys/net/ipv6/conf/$ra_if/accept_ra" ] && echo "net.ipv6.conf.$ra_if.accept_ra = 2"
       echo "net.ipv6.conf.all.forwarding = 1"
     fi
   } > /etc/sysctl.d/99-swanstrap.conf
-  sysctl -q -p /etc/sysctl.d/99-swanstrap.conf
+  sysctl -q -p /etc/sysctl.d/99-swanstrap.conf || warn "some sysctls couldn't be applied"
+}
+# Without an IPv6 uplink, replies to the client's IPv6 pool need a route to reach the
+# IPsec policy (which then encrypts them); otherwise the refusal never gets back.
+pool6_route() {
+  [ $HAS_V6 = 1 ] && return
+  ip -6 route replace "$POOL6" dev "$IF" 2>/dev/null ||
+    warn "couldn't route $POOL6 (IPv6 disabled on $IF?); client IPv6 is still blocked, just not refused instantly"
 }
 
 # rule <iptables|ip6tables> <table> <chain> <rule...>: add once; ACCEPTs go before the
@@ -113,7 +123,7 @@ apply)
   [ -n "$IF" ] || die "no IPv4 default route"
   iptables -m policy -h >/dev/null 2>&1 || modprobe xt_policy 2>/dev/null ||
     die "kernel lacks the iptables 'policy' match (xt_policy)"
-  sysctls
+  sysctls; pool6_route
   if ufw_active; then apply_ufw; echo "firewall: ufw rules updated (uplink $IF, IPv6 uplink: $HAS_V6)"
   else apply_iptables; echo "firewall: iptables rules applied (uplink $IF, IPv6 uplink: $HAS_V6)"; fi ;;
 status)

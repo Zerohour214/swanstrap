@@ -9,7 +9,8 @@
 #   swanstrap list                                     servers, users, devices, who is connected
 #   swanstrap add-server <id> <City> <region> <ip>     CA server: bundle to install another server
 #                                                      id = provider-country-city-nn, e.g. aws-de-fra-01
-#   swanstrap sync-kit   <kit-dir>                     CA server: copy CA + inventory into your kit repo
+#   swanstrap sync-kit   <kit-dir> [--push]            CA server: copy CA + inventory into your kit repo;
+#                                                      --push also commits (if changed) and pushes
 #   swanstrap upgrade-strongswan                       update strongSwan (source build or apt)
 #   swanstrap firewall                                 show the VPN firewall state
 #
@@ -249,18 +250,31 @@ Next steps:
   1. scp $BUNDLE <user>@$NADDR:
   2. ssh <user>@$NADDR 'tar xf swanstrap-$ID.tar && sudo ./swanstrap/lib/install.sh && rm -r swanstrap-$ID.tar swanstrap'
   3. In the cloud firewall for $NADDR allow inbound UDP 500 and UDP 4500.
-  4. Save the updated inventory: sudo swanstrap sync-kit <your swanstrap repo>
+  4. Delete the bundle, then save the inventory: sudo swanstrap sync-kit <your swanstrap repo> --push
 EOF
   ;;
 
 sync-kit)
-  KITDIR=${1:?usage: swanstrap sync-kit <kit-dir>}; [ -f "$KITDIR/bootstrap.sh" ] || die "$KITDIR is not a swanstrap kit"
+  KITDIR=${1:?usage: swanstrap sync-kit <kit-dir> [--push]}; [ -f "$KITDIR/bootstrap.sh" ] || die "$KITDIR is not a swanstrap kit"
   [ -d $CA ] || die "no CA on this server"
   mkdir -p "$KITDIR/ca"
   cp $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc $CA/servers.tsv "$KITDIR/ca/"
   chown -R --reference="$KITDIR" "$KITDIR/ca"
-  echo "Copied CA (encrypted) + inventory into $KITDIR/ca. Commit and push:"
-  echo "  cd $KITDIR && git add ca && git commit -m 'Update CA inventory' && git push" ;;
+  echo "Copied CA (encrypted) + inventory into $KITDIR/ca"
+  if [ "${2:-}" = --push ]; then
+    # Run git as the repo's owner with their HOME, so their git identity and credentials are used
+    OWNER=$(stat -c %U "$KITDIR"); OHOME=$(getent passwd "$OWNER" | cut -d: -f6)
+    g() { runuser -u "$OWNER" -- env HOME="$OHOME" git -C "$KITDIR" "$@"; }
+    [ -n "$(g config user.email || true)" ] || die "git has no identity for $OWNER yet. As $OWNER run:
+  git config --global user.name  \"Your Name\"
+  git config --global user.email \"<id>+<username>@users.noreply.github.com\"   (GitHub → Settings → Emails)"
+    g add ca
+    if g diff --cached --quiet; then echo "ca/ unchanged: nothing to commit"
+    else g commit -q -m "Update CA inventory ($SERVER_ID)"; echo "committed"; fi
+    g push -q && echo "pushed"
+  else
+    echo "Save it to GitHub: sudo swanstrap sync-kit $KITDIR --push"
+  fi ;;
 
 remove)
   NAME=${1:?usage: swanstrap remove <name>}; valid_name "$NAME"; found=
