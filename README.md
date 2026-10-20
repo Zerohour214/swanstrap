@@ -1,489 +1,539 @@
 # swanstrap
 
-**Your own post-quantum VPN, rebuilt on any server with one command.**
-
-swanstrap sets up and manages a private VPN based on [strongSwan](https://strongswan.org) (IPsec / IKEv2).
-It uses **post-quantum encryption** (ML-KEM) where your devices support it. Everything needed to rebuild
-it lives in this repository, so even if every server is gone you can be back online in minutes:
+Bootstrap and operate a multi-region **IKEv2/IPsec remote-access VPN** with a **hybrid post-quantum key exchange**
+(X25519 + ML-KEM-768, RFC 9370 / FIPS 203) on strongSwan 6, from a single Git repository.
 
 ```bash
 git clone https://github.com/<you>/swanstrap.git
-sudo ./swanstrap/bootstrap.sh --quick
+sudo ./swanstrap/bootstrap.sh --quick          # fresh Debian/Ubuntu VPS -> running VPN + CA in minutes
 ```
+
+- **Idempotent bash.** No agents, no external control plane. State lives in this repo (`ca/`) and on each server.
+- **Self-contained PKI.** One offline-able root CA. Its key is committed **encrypted** (PKCS#8, PBKDF2 + AES-256-CBC).
+- **Full tunnel, dual stack.** `0.0.0.0/0` and `::/0`, with IPv6 leak protection. Policy-based IPsec (xfrm) with NAT-T, MOBIKE and IKE fragmentation.
+- **Provider-agnostic.** Auto-detects OCI, AWS, GCP, Azure, DigitalOcean, Hetzner, Vultr and Linode. Anything else falls back to defaults.
 
 ---
 
 ## Table of contents
 
-1. [The big picture](#1-the-big-picture)
-2. [Key ideas in plain words](#2-key-ideas-in-plain-words)
-3. [Quick start: build a VPN from nothing](#3-quick-start-build-a-vpn-from-nothing)
-4. [How deployment works](#4-how-deployment-works)
-5. [Adding more servers](#5-adding-more-servers)
-6. [Connecting your devices](#6-connecting-your-devices)
-7. [Everyday commands](#7-everyday-commands)
-8. [Customizing the setup](#8-customizing-the-setup)
-9. [Security: what is secret and where it lives](#9-security-what-is-secret-and-where-it-lives)
-10. [Inside a server](#10-inside-a-server)
-11. [Maintenance](#11-maintenance)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Repository layout](#13-repository-layout)
+1. [Flow](#1-flow)
+2. [Definitions](#2-definitions)
+3. [Requirements and compatibility](#3-requirements-and-compatibility)
+4. [Deploy](#4-deploy)
+5. [Bootstrap internals](#5-bootstrap-internals)
+6. [IKE / IPsec design](#6-ike--ipsec-design)
+7. [PKI](#7-pki)
+8. [Network design](#8-network-design)
+9. [Multi-server operation](#9-multi-server-operation)
+10. [Client provisioning](#10-client-provisioning)
+11. [CLI reference](#11-cli-reference)
+12. [Configuration reference](#12-configuration-reference)
+13. [Security model](#13-security-model)
+14. [Server layout](#14-server-layout)
+15. [Operations](#15-operations)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Code map and testing](#17-code-map-and-testing)
 
 ---
 
 ## 1. Flow
 
+### Control plane (provisioning)
+
 ```
-   ┌──────────────────────────────┐
-   │  GitHub (private repo)       │   The "recipe": scripts + encrypted CA key
-   │  swanstrap                   │   + list of all your servers.
-   └──────────────┬───────────────┘   Nothing in here is usable without your passphrase.
-                  │ git clone
-                  ▼
-   ┌──────────────────────────────┐        bundle (.tar)        ┌──────────────────────────────┐
-   │  CA server                   │ ──────────────────────────▶ │  More VPN servers            │
-   │  e.g. OCI-PQ Singapore       │   swanstrap add-server      │  e.g. AWS-PQ Frankfurt       │
-   │                              │                             │                              │
-   │  • runs the VPN              │                             │  • runs the VPN              │
-   │  • holds the CA              │                             │  • no CA (can't issue        │
-   │    (issues certificates)     │                             │    certificates)             │
-   └──────────────┬───────────────┘                             └──────────────┬───────────────┘
-                  │  IKEv2 / IPsec (UDP 500 + 4500)                            │
-                  ▼                                                            ▼
-   ┌──────────────────────────────────────────────────────────────────────────────────────────┐
-   │  Your devices: Windows, iPhone, iPad, Mac, Android/Linux (strongSwan app)                │
-   │  Each device trusts "PQ-VPN Root CA" once and can then connect to every server.         │
-   └──────────────────────────────────────────────────────────────────────────────────────────┘
+             ┌─────────────────────────────────────────────┐
+             │ Git repo (private)                          │
+             │  scripts · templates · vendor/strongSwan    │
+             │  ca/ : root cert, ENCRYPTED root key,       │
+             │        servers.tsv (inventory)              │
+             └───────────────┬─────────────────────────────┘
+                git clone    │                 ▲ git push (sync-kit)
+                             ▼                 │
+             ┌─────────────────────────────────────────────┐   swanstrap add-server
+             │ CA server (first bootstrapped node)         │ ─────────────────────────┐
+             │  /root/vpn-ca : CA key (encrypted), issued/ │   tar bundle:            │
+             │  issues server + device certificates        │   kit + site/{conf,      │
+             └─────────────────────────────────────────────┘        cert,key}          ▼
+                                                             ┌──────────────────────────────┐
+                                                             │ Member server (no CA key)    │
+                                                             │  lib/install.sh              │
+                                                             └──────────────────────────────┘
 ```
 
-- **One repo** holds everything needed to rebuild.
-- **One CA server** (the first server you build) is the "office" that hands out certificates.
-- **Any number of VPN servers** in different countries and with different providers. They all share one identity system, so
-  a device set up once trusts all of them.
+### Data plane (per client)
+
+```
+ client                                     VPN server (charon)                         Internet
+   │ IKE_SA_INIT  UDP/500  KE=x25519 (+ADDKE1=mlkem768 offered)   │
+   │────────────────────────────────────────────────────────────▶ │
+   │ IKE_INTERMEDIATE      ML-KEM-768 exchange (RFC 9242/9370)    │   only if the client supports ML-KEM
+   │◀────────────────────────────────────────────────────────────▶│
+   │ IKE_AUTH     UDP/4500 server: RSA cert (SAN=IP)              │
+   │                       client: EAP-MSCHAPv2 | RSA cert        │
+   │                       CP: IPv4 + IPv6 virtual IP, DNS        │
+   │ CHILD_SA  ESP-in-UDP/4500, TS 0.0.0.0/0, ::/0                │
+   │═════════════════════════════════════════════════════════════▶│ xfrm decap → FORWARD → SNAT ──▶
+```
+
+### Bootstrap pipeline
+
+```
+ bootstrap.sh
+  ├─ install.sh --base       preflight (OS, root, kernel xfrm/esp4), cloud-init wait, apt lock wait, base pkgs
+  ├─ resolve settings        option > --config > detect (DMI → metadata → region table → geo-IP) > default
+  ├─ validate                all inputs, before any further change
+  ├─ CA                      restore: decrypt ca/*.key.enc (fail fast) | new: RSA-4096 root
+  ├─ install.sh --prepare    strongSwan: distro pkg w/ ML-KEM → latest 6.x source (GPG) → vendored 6.1.0
+  ├─ site/                   server cert, server.conf, pq-vpn.conf (from template)
+  ├─ install.sh --site       kit → /usr/local/share/swanstrap, swanctl files, firewall, start, verify, first user
+  └─ write back              ca/{crt,key.enc,servers.tsv} → commit + push (manual)
+```
 
 ---
 
 ## 2. Definitions
 
-| Term | What it means here |
+| Term | Meaning |
 |---|---|
-| **VPN server** | A cloud machine (VPS) that your devices connect to. Your internet traffic leaves from there. |
-| **CA** (certificate authority) | Your own private "ID office" called **PQ-VPN Root CA**. It signs the certificates that prove a server (or device) is really yours. Devices install the CA **once**. |
-| **CA server** | The server that holds the CA's private key and can therefore issue new certificates. It's the first server you bootstrap. |
-| **CA passphrase** | The password that unlocks the CA key. **The single most important secret.** Never stored in the repo. |
-| **Kit** | This repository: scripts, templates, the strongSwan source as a fallback, and the CA key **encrypted with the passphrase**. |
-| **Inventory** | `ca/servers.tsv`: a list of every server (name, provider, country, IP, address pool). |
-| **Username login** | A username and password. Simple; meant for you. Created per server. |
-| **Device login** | A certificate made for one device (e.g. a friend's phone). Can have an expiry date. Works on every server. |
-| **Post-quantum (ML-KEM)** | New encryption designed to resist future quantum computers. Used **together with** classical X25519 ("hybrid"), so it's never weaker than today's standard. |
-| **Server ID / name** | e.g. `oci-sg-sin-01` / **OCI-PQ Singapore**: `<provider>-<country>-<city>-<number>`. The name is what shows in your device's VPN list. |
-
-> **Which devices get post-quantum?** Devices running strongSwan 6.x (Linux, Android app, macOS app) negotiate ML-KEM.
-> The VPN clients **built into Windows and iOS don't support ML-KEM yet**, so they use strong classical encryption
-> (AES-256-GCM, SHA-384, ECP-384). The server offers post-quantum first and uses it whenever the device can.
+| **Kit** | This repository. Installed on every server at `/usr/local/share/swanstrap` (without `.git` and `ca/`). |
+| **CA server** | The node created by `bootstrap.sh`. Holds `/root/vpn-ca` and is the only node that can sign certificates (`add-device`, `add-server`). |
+| **Member server** | A node installed from an `add-server` bundle. It has the root cert and its own leaf key, never the CA key. |
+| **Site** | The per-server input to `install.sh`: `server.conf`, `pq-vpn-root-ca.crt`, `<id>.crt`, `<id>.key`, `pq-vpn.conf`. |
+| **Inventory** | `servers.tsv`, the authoritative list of servers. Used for ID numbering, pool allocation and re-IP detection. |
+| **Server ID** | `<provider>-<cc>-<city3>-<nn>` (regex `^[a-z0-9]+-[a-z]{2}-[a-z]{3}-[0-9]{2}$`), e.g. `oci-sg-sin-01`. Used for file names and certificate names. |
+| **Display name** | `<PROVIDER>-PQ <City>`, e.g. `OCI-PQ Singapore`. The certificate CN and the VPN name on clients. |
+| **User login** | EAP-MSCHAPv2 credential, scoped to **one server** (`/etc/swanctl/conf.d/pq-vpn-user-<name>.conf`). |
+| **Device login** | Client certificate (`clientAuth`, SAN `<name>@pqvpn`). Valid on **all** servers. No CRL, so revocation means expiry. |
+| **Hybrid PQ** | IKEv2 multiple key exchanges (RFC 9370): classical KE (X25519) + additional KE (ML-KEM-768). The keys are combined, so security is at least that of the stronger one. |
 
 ---
 
-## 3. Quick start: build a VPN from nothing
+## 3. Requirements and compatibility
 
-### What you need
+### Server
 
-- A fresh **Ubuntu 22.04+ or Debian 12+** VPS. It must be a full VM (KVM). OpenVZ/LXC containers can't run IPsec.
-- SSH access as a user with `sudo`, or as root.
-- Your GitHub login, to clone this private repo.
-- Your **CA passphrase**, if you want devices set up earlier to keep working. Without it, use `--new-ca`.
+| Requirement | Detail |
+|---|---|
+| OS | Debian 12+, Ubuntu 22.04+ (apt). Others are refused in preflight. |
+| Virtualization | KVM / full VM. OpenVZ is refused. LXC works only if the host provides xfrm. |
+| Kernel | `xfrm_user`, `esp4`, `xt_policy` (checked via `/sys/module`, `modprobe`, `modules.builtin`) |
+| Resources | Package install: trivial. Source build: ≥ 1.5 GB free disk; RAM-aware `make -j` (~700 MB/job); 1 GB temporary swap if RAM < 1.5 GB |
+| Inbound | UDP 500, UDP 4500 (ESP/50 optional, only for clients not behind NAT) |
+| Firewall | iptables (nft or legacy backend) or an active `ufw` |
 
-### Steps
+**Tested** (fresh containers, `--privileged`):
 
-**1. Get the kit onto the server**
+| Image | strongSwan path | ML-KEM provider |
+|---|---|---|
+| Ubuntu 22.04 | source (latest 6.x) | `ml` plugin |
+| Ubuntu 24.04 (strongswan.org blocked) | vendored 6.1.0 | `ml` plugin |
+| Ubuntu 26.04 | distro 6.0.4 | `openssl` (OpenSSL 3.5) |
+| Debian 12 + ufw active | source | `ml` plugin |
+| Fedora 40 | refused in preflight | n/a |
+
+### Clients
+
+| Client | KE negotiated | IKE / ESP | Auth |
+|---|---|---|---|
+| strongSwan 6.x (Linux, Android app, macOS app) | **X25519 + ML-KEM-768** | AES-256-GCM / PRF-SHA384 | EAP or cert |
+| Windows 10/11 built-in (after `.ps1`) | ECP-384 | AES-256 + SHA-384 / AES-256-GCM | EAP-MSCHAPv2 or machine cert |
+| iOS / iPadOS / macOS built-in (`.mobileconfig`) | ECP-384 (group 20) | AES-256-GCM + SHA2-384 | EAP or cert |
+| iOS manual setup | MODP-2048 (group 14) | AES-256 + SHA2-256 | EAP |
+
+Windows and Apple native IKEv2 stacks don't implement RFC 9370 / ML-KEM. They get classical-only key exchange.
+
+---
+
+## 4. Deploy
+
+### First node (CA server)
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/<you>/swanstrap.git
+git clone https://github.com/<you>/swanstrap.git          # fine-grained PAT, Contents: read
+./swanstrap/bootstrap.sh --quick --dry-run                  # resolved settings + preflight; no changes, no root
+sudo ./swanstrap/bootstrap.sh --quick                       # prompts for the CA passphrase if ca/ exists
 ```
 
-> GitHub doesn't accept your account password for `git clone`. Create a **fine-grained personal access token**:
-> GitHub → Settings → Developer settings → Fine-grained tokens → *Only select repositories: swanstrap*,
-> permission **Contents: Read-only** (or *Read and write* if you'll push from the server). Paste it as the password.
+Then:
 
-**2. Preview (optional, changes nothing)**
+1. Allow inbound **UDP 500/4500** in the provider's security list / security group.
+2. Persist the CA and inventory: `cd swanstrap && git add ca && git commit -m "Bootstrap <id>" && git push`.
+3. Fetch the client artifacts: `scp -r <user>@<ip>:~/vpn-clients .` (see [§10](#10-client-provisioning)).
 
-```bash
-./swanstrap/bootstrap.sh --quick --dry-run
-```
+### Modes
 
-**3. Install**
+| Mode | Invocation | Interaction |
+|---|---|---|
+| Quick | `--quick` | None (only the CA passphrase prompt when restoring; avoid it with `--ca-passphrase-file`) |
+| Guided | *(no mode flag)* | TTY prompts per value, with dependent values (ID, name, pool) re-derived after edits |
+| Declarative | `--config file.env` (+ `--quick`) | None; fully reproducible |
+| Plan | `--dry-run` | Prints the resolution table with each value's source, plus preflight. Exits without changes |
 
-```bash
-sudo ./swanstrap/bootstrap.sh --quick
-```
+### Additional nodes
 
-It asks for the CA passphrase, then works on its own for 2–15 minutes. It is slower when strongSwan has to be compiled.
-
-**4. Open the firewall at your cloud provider**: allow inbound **UDP 500** and **UDP 4500**
-(OCI: *Security List*; AWS: *Security Group*; GCP: *Firewall rule*; Hetzner/DO: *Cloud Firewall*).
-
-**5. Save the updated inventory to GitHub** (bootstrap prints this command):
-
-```bash
-cd swanstrap && git add ca && git commit -m "Bootstrap <server-id>" && git push
-```
-
-**6. Set up your devices**: copy the login files to your computer, then follow [section 6](#6-connecting-your-devices):
-
-```bash
-scp -r <user>@<server-ip>:~/vpn-clients .
-```
+See [§9](#9-multi-server-operation).
 
 ---
 
-## 4. How deployment works
+## 5. Bootstrap internals
 
-### What `bootstrap.sh` does, step by step
+### Settings resolution
 
-```
- sudo ./bootstrap.sh --quick
-        │
-        ▼
- ① Base tools ──────── preflight (Debian/Ubuntu? kernel has IPsec?), wait for first-boot
-        │               updates to release apt, install curl/openssl/git/...
-        ▼
- ② Detect settings ─── provider (hardware info) → region (provider metadata) → city/country
-        │               (built-in region table, else geo-IP) → public IP → server ID, name, pool
-        ▼
- ③ CA ──────────────── restore the CA from ca/ (asks passphrase, checked BEFORE anything big)
-        │               or create a new one (--new-ca, or if the kit CA expired)
-        ▼
- ④ strongSwan ──────── distro package if it supports ML-KEM, else build the latest 6.x from
-        │               source (GPG-verified), else the bundled 6.1.0 (works offline)
-        ▼
- ⑤ Server identity ─── issue this server's certificate, write /etc/swanstrap/server.conf,
-        │               generate the strongSwan config from templates/pq-vpn.conf.tmpl
-        ▼
- ⑥ Install ─────────── lib/install.sh: copy kit to /usr/local/share/swanstrap, firewall + NAT
-        │               + IPv6 leak protection, start strongSwan, verify ML-KEM is offered
-        ▼
- ⑦ First login ─────── create the "personal" username login + install files in ~/vpn-clients/
-        │
-        ▼
- ⑧ Save ────────────── copy CA (encrypted) + inventory back into the repo's ca/ → you commit & push
-```
+`option > --config > detected > default`, resolved per key. Each value's source is shown in the plan table
+(`option`, `config`, `detected`, `derived`, `inventory`, `default`, `you`).
 
-Every step checks itself and stops with a clear message if something is wrong. Running it again is safe.
+| Source | Mechanism |
+|---|---|
+| **Provider** | DMI (`/sys/class/dmi/id/{sys_vendor,chassis_asset_tag,bios_vendor,bios_version,product_name,board_vendor}`). Metadata alone is ambiguous because every cloud answers on `169.254.169.254`. |
+| **Region** | Only the detected provider's endpoint is queried (OCI `/opc/v2/instance/` + `Authorization: Bearer Oracle`, AWS IMDSv2, GCP `Metadata-Flavor`, Azure `Metadata: true`, DO, Hetzner, Vultr). 2 s timeout each. |
+| **City / country** | Built-in `provider\|region → City\|CC` table (~150 regions), then geo-IP (ip-api.com → ipinfo.io). Geo-IP often returns suburbs, so it's only the fallback. Values are transliterated to ASCII. |
+| **Public IPv4** | Provider metadata (AWS, GCP, DO, Hetzner) → api.ipify.org → icanhazip.com → `ip route get` source address |
+| **ID** | `<provider>-<cc>-<city3>-<next free nn in inventory>` |
+| **Pool** | Next free `10.20.N.0/24` (N ≥ 20) that is not in the inventory **and** doesn't overlap any local route (VPC, Docker bridges) |
+| **Re-run** | An inventory row matching the public IP (or `--id`) → reuse its ID and pool. A different IP → re-IP (certificate reissued). |
 
-### How settings are chosen
+`--offline` disables internet lookups (metadata still used). `--no-detect` disables all detection.
 
-Each setting is taken from the first source that has it:
+### CA handling
 
-```
-  command-line option   →   --config file   →   auto-detected   →   built-in default
-  (--city Hanoi)            (CITY=Hanoi)        (cloud metadata)      (Server)
-```
+| Condition | Action |
+|---|---|
+| `ca/` valid, `CA_MODE=auto\|restore` | Restore. The passphrase is verified **before** strongSwan is installed. The `.key.enc` is copied byte-for-byte, never re-encrypted, so no git churn. |
+| `ca/` expired, `auto` | New CA (noted in the output). `restore` aborts. |
+| `ca/` < 1 year left | Warning |
+| `ca/` unreadable | Abort. Never silently treated as expired. |
+| `--new-ca` | New RSA-4096 root. The old `ca/` is moved to `ca.old-<ts>/`. Passphrase: prompted twice (guided), `--ca-passphrase-file`, or generated (`--quick`, printed once and written to `CREDENTIALS.txt`). |
 
-So `--quick` always works, even on an unknown provider with no internet lookups. You just get plain
-default names like **VPS-PQ Server** (`vps-xx-ser-01`). See [section 8](#8-customizing-the-setup) for every setting.
+### strongSwan acquisition (`STRONGSWAN=auto`)
 
-### What a connection looks like
+1. Distro candidate ≥ 6.0 → install `charon-systemd strongswan-swanctl strongswan-pki libstrongswan-{standard,extra}-plugins libcharon-extra-plugins`.
+   It's accepted only if the **running** daemon lists `ML_KEM_*` (`swanctl --list-algs`), since ML-KEM may come from the `ml` plugin or from OpenSSL ≥ 3.5.
+2. Otherwise, purge it and build the **latest 6.x** from download.strongswan.org. The tarball is GPG-verified against `vendor/STRONGSWAN-RELEASE-PGP-KEY` (falling back to the published key, with a warning).
+3. If that fails or there's no network, use **`vendor/strongswan-6.1.0.tar.bz2`**.
+4. Source installs are pinned against distro packages (`/etc/apt/preferences.d/no-distro-strongswan`). The mode is recorded in `/var/lib/swanstrap/strongswan`.
 
-```
- Device                                   VPN server                                  Internet
-   │  1. IKE_SA_INIT (UDP 500)               │
-   │  ── offers: X25519 + ML-KEM-768 ──────▶ │  (Windows/iOS offer ECP-384 instead)
-   │  2. IKE_AUTH (UDP 4500)                 │
-   │  ── server proves itself with its ────▶ │  certificate signed by PQ-VPN Root CA
-   │     certificate; device logs in with    │
-   │     username/password or its own cert   │
-   │  3. device gets 10.20.20.x (+ IPv6)     │
-   │  ══ all traffic, encrypted (ESP) ═════▶ │ ── NAT ──▶  websites see the server's IP
-```
+Configure flags: `vendor/configure-options.txt`
+(`--enable-ml --enable-openssl --enable-systemd --enable-swanctl --enable-eap-{identity,mschapv2,tls,dynamic} --enable-farp --enable-dhcp --enable-curl --disable-stroke`).
+
+### Robustness measures
+
+`cloud-init status --wait`, `DPkg::Lock::Timeout=600`, `NEEDRESTART_SUSPEND=1`, `DEBIAN_FRONTEND=noninteractive`,
+secrets only in tmpfs (`/run`), shredded on exit. Every step is idempotent: firewall rules are checked with `-C` before insertion, and re-runs overwrite generated files.
 
 ---
 
-## 5. Adding more servers
+## 6. IKE / IPsec design
 
-New servers are prepared **on the CA server**, because only it can issue their certificates. The new server only
-receives a ready-made bundle; it never sees the CA key.
+Generated from `templates/pq-vpn.conf.tmpl` into `/etc/swanctl/conf.d/pq-vpn.conf`.
+
+### Proposals (server preference order)
+
+| SA | Proposals |
+|---|---|
+| IKE | `aes256gcm16-prfsha384-x25519-ke1_mlkem768`, `aes256gcm16-prfsha384-ecp384`, `aes256-sha384-ecp384`, `aes256-sha256-ecp384`, `aes256-sha256-modp2048` |
+| ESP | `aes256gcm16-x25519-ke1_mlkem768`, `aes256gcm16-ecp384`, `aes256gcm16`, `aes256-sha256` |
+
+`ke1_mlkem768` = additional key exchange #1 (RFC 9370). Peers that don't support it match the next proposal.
+No 3DES, SHA-1, MODP-1024 or other weak algorithms are accepted.
+
+### Connections
+
+| Name | Remote auth | Notes |
+|---|---|---|
+| `pq-vpn` | `pubkey` (cert chaining to `pq-vpn-root-ca.crt`) | Device logins |
+| `pq-vpn-eap` | `eap-mschapv2`, `eap_id=%any` | Inherits `pq-vpn`; user logins |
+
+charon chooses the connection during IKE_AUTH: if the client omits the AUTH payload, it selects the EAP connection.
+
+### Parameters
+
+| Parameter | Value |
+|---|---|
+| Local auth | `pubkey`, `id = <public IP>`, `send_cert = always` |
+| Traffic selectors | local `0.0.0.0/0, ::/0` (full tunnel) |
+| Virtual IPs | `pq-pool` (IPv4 /24) + `pq-pool6` (IPv6 /64), assigned via a CP payload, plus DNS |
+| Rekey | IKE 4 h, CHILD 1 h; `reauth_time = 0` (no reauthentication) |
+| DPD | 30 s, CHILD `dpd_action = clear` |
+| `unique` | `replace` (a reconnect from the same identity replaces the old SA) |
+| Fragmentation | `yes` (RFC 7383; needed for large certificate chains through UDP) |
+| NAT-T / MOBIKE | strongSwan defaults (on) |
+| Mode | Tunnel, policy-based (xfrm policies; no xfrm interfaces / route-based) |
+
+---
+
+## 7. PKI
+
+| Object | Key | Validity | Subject / SAN | EKU / flags |
+|---|---|---|---|---|
+| Root CA | RSA-4096 | 10 y | `O=PQ-VPN, CN=PQ-VPN Root CA` | `CA:TRUE` |
+| Server | RSA-3072 | 5 y | `C=<cc>, O=PQ-VPN, OU=<PROVIDER>, L=<City>, CN=<display name>`; SAN `IP:<addr>`, `DNS:<addr>` | `serverAuth`, `ikeIntermediate` (1.3.6.1.5.5.8.2.2, required by Windows) |
+| Device | RSA-3072 | `days` (default 1825) | `O=PQ-VPN, OU=device, CN=<name>@pqvpn`; SAN `email:<name>@pqvpn` | `clientAuth` |
+
+- Signatures: SHA-384 with RSA. All certificates are back-dated 24 h (`notBefore`) to tolerate client clock skew.
+- The CA key at rest is PKCS#8 `ENCRYPTED PRIVATE KEY` (PBKDF2-HMAC-SHA256 + AES-256-CBC). It's decrypted only into `/run` (tmpfs) for signing, then shredded.
+- Device bundles are PKCS#12 with `PBE-SHA1-3DES` / MAC SHA-1. That's a deliberate compatibility choice: it's the format both the Windows and iOS importers accept. The `.p12` is only a transport container, protected by a random install password.
+- RSA is used rather than ECDSA for maximum native-client compatibility (Windows machine-cert auth, iOS `CertificateType`).
+- No CRL/OCSP. Revocation equals expiry, so use short lifetimes for temporary devices.
+
+---
+
+## 8. Network design
+
+### Addressing plan
+
+| Item | Scheme | Example (`oci-sg-sin-01`) |
+|---|---|---|
+| Client IPv4 pool | `10.20.N.0/24`, N = 20, 21, … per server | `10.20.20.0/24` |
+| Client IPv6 pool | `fd20:A:B::/64` derived from pool `10.A.B.0/24` (ULA) | `fd20:20:20::/64` |
+| Client DNS | `DNS` setting | `1.1.1.1, 9.9.9.9` |
+| Egress | SNAT (MASQUERADE) to the uplink address | `enp0s6` → `198.51.100.10` |
+
+Pools are unique across servers (inventory) and are checked against local routes, so they don't collide with VPC or Docker ranges.
+
+### Firewall (`lib/firewall.sh`)
+
+**iptables mode** (default). Applied at boot by `swanstrap-firewall.service`
+(`After=netfilter-persistent ufw docker`, `Before=strongswan`). ACCEPT rules are inserted **before** the first
+REJECT/DROP in the chain (e.g. OCI's default `REJECT all`):
 
 ```
-   CA server                                         new VPS (fresh)
- ┌──────────────────────────────┐   scp bundle    ┌──────────────────────────────┐
- │ swanstrap add-server …       │ ──────────────▶ │ tar xf swanstrap-<id>.tar    │
- │  • checks the ID is free     │                 │ sudo ./swanstrap/lib/        │
- │  • picks the next free pool  │                 │        install.sh            │
- │  • issues server certificate │                 │  • strongSwan + ML-KEM       │
- │  • adds it to the inventory  │                 │  • firewall, NAT, IPv6       │
- │  • builds swanstrap-<id>.tar │                 │  • "personal" login          │
- └──────────────────────────────┘                 └──────────────────────────────┘
+filter INPUT    -p udp -m multiport --dports 500,4500 -j ACCEPT
+filter INPUT    -p esp -j ACCEPT
+filter FORWARD  -s $POOL -m policy --dir in  --pol ipsec --proto esp -j ACCEPT
+filter FORWARD  -d $POOL -m policy --dir out --pol ipsec --proto esp -j ACCEPT
+nat    POSTROUTING -s $POOL -o $IF -m policy --dir out --pol none -j MASQUERADE
+mangle FORWARD  -s $POOL -o $IF -m policy --dir in  --pol ipsec -p tcp --tcp-flags SYN,RST SYN -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1360
+mangle FORWARD  -d $POOL        -m policy --dir out --pol ipsec -p tcp --tcp-flags SYN,RST SYN -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1360
 ```
+
+- `--pol none` on MASQUERADE keeps traffic that is itself IPsec from being NAT'd.
+- `xt_policy` binds FORWARD acceptance to packets that actually arrived through or leave via an SA.
+
+**IPv6:**
+
+| Server has global IPv6 + default route | Rules |
+|---|---|
+| Yes | ip6tables FORWARD policy accepts for `$POOL6` + NAT66 MASQUERADE out the v6 uplink; `net.ipv6.conf.all.forwarding=1` and `accept_ra=2` on the uplink (otherwise enabling forwarding drops SLAAC/RA routes) |
+| No | `ip6tables -I FORWARD 1 -s $POOL6 -j REJECT --reject-with icmp6-adm-prohibited`. Clients receive a v6 address, so IPv6 can't leak around the tunnel, and the immediate reject makes Happy Eyeballs fall back to IPv4 |
+
+**ufw mode** (ufw active): the same rules go into `/etc/ufw/before.rules` and `before6.rules` (`*nat` / `*mangle`
+blocks at the top, `ufw-before-forward` / `ufw6-before-forward` rules after `# End required lines`), between
+`# swanstrap BEGIN/END <tag>` markers, then `ufw reload`. No `iptables-persistent`, so ufw is never removed.
+
+**sysctl:** `/etc/sysctl.d/99-swanstrap.conf` (`net.ipv4.ip_forward=1`, plus the IPv6 settings above).
+
+---
+
+## 9. Multi-server operation
+
+### Inventory schema (`ca/servers.tsv`, TSV with header)
+
+```
+id  name  provider  country  city  region  address  pool  added
+oci-sg-sin-01  OCI-PQ Singapore  OCI  SG  Singapore  ap-singapore-1  198.51.100.10  10.20.20.0/24  2026-10-20
+```
+
+### Adding a member server
 
 ```bash
-# 1. On the CA server
+# CA server: validates the ID/name/IP are unique, allocates the next pool, signs the server cert, updates the inventory
 sudo swanstrap add-server aws-de-fra-01 Frankfurt eu-central-1 203.0.113.20
+#   -> ~/vpn-clients/AWS-PQ-Frankfurt/swanstrap-aws-de-fra-01.tar   (kit + site/, contains the leaf private key)
 
-# 2. Copy and install
 scp ~/vpn-clients/AWS-PQ-Frankfurt/swanstrap-aws-de-fra-01.tar ubuntu@203.0.113.20:
 ssh ubuntu@203.0.113.20 'tar xf swanstrap-aws-de-fra-01.tar && sudo ./swanstrap/lib/install.sh && rm -r swanstrap-aws-de-fra-01.tar swanstrap'
 
-# 3. Open UDP 500 + 4500 in that provider's firewall
-
-# 4. Back on the CA server: delete the bundle (it contains the new server's private key) and save the inventory
-rm ~/vpn-clients/AWS-PQ-Frankfurt/swanstrap-aws-de-fra-01.tar
-sudo swanstrap sync-kit ~/swanstrap
-cd ~/swanstrap && git add ca && git commit -m "Add aws-de-fra-01" && git push
+rm ~/vpn-clients/AWS-PQ-Frankfurt/swanstrap-aws-de-fra-01.tar           # the bundle holds a private key
+sudo swanstrap sync-kit ~/swanstrap && (cd ~/swanstrap && git add ca && git commit -m "Add aws-de-fra-01" && git push)
 ```
 
-Each server gets its own address pool (`10.20.20.0/24`, `10.20.21.0/24`, …) and shows up as its own entry
-on your devices (e.g. **AWS-PQ Frankfurt**).
-
----
-
-## 6. Connecting your devices
-
-Every login comes as **one self-contained file** in `~/vpn-clients/<Server-Name>/`:
-
-| File | For | What it does |
-|---|---|---|
-| `users/<name>-<Server>.ps1` | Windows (username login) | Installs the CA, creates the VPN with strong settings |
-| `users/<name>-<Server>.mobileconfig` | iPhone / iPad / Mac (username login) | Profile with the CA and VPN settings; asks for your password |
-| `devices/<name>-<Server>.ps1` | Windows (device login) | Also installs the device certificate (asks its install password) |
-| `devices/<name>-<Server>.mobileconfig` | iPhone / iPad / Mac (device login) | Also contains the device certificate (asks its install password) |
-
-Passwords are in `~/vpn-clients/CREDENTIALS.txt`.
-
-### Windows 10 / 11
-
-1. Copy the `.ps1` file to the PC and open its folder in File Explorer.
-2. Type `powershell` in the address bar and press Enter, then open an **Administrator** window in the same folder:
-   ```powershell
-   Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -Command cd '$PWD'"
-   ```
-3. In the Administrator window:
-   ```powershell
-   Set-ExecutionPolicy -Scope Process Bypass
-   .\personal-OCI-PQ-Singapore.ps1
-   ```
-4. **Settings → Network & internet → VPN → OCI-PQ Singapore → Connect.** Enter your username and password the first time.
-
-### iPhone / iPad
-
-1. Send the `.mobileconfig` to the phone (AirDrop, iCloud Drive → Files app, or email) and open it.
-2. **Settings → Profile Downloaded → Install**, enter your passcode, then your VPN password (or the device's install password).
-3. **Once per device:** Settings → General → About → **Certificate Trust Settings** → turn on **PQ-VPN Root CA**.
-4. **Settings → VPN → OCI-PQ Singapore** → on.
-
-### Check that it works
-
-Search "what is my IP" in a browser: it should show the **server's** IP.
-
-### Manual setup (without the files)
-
-Install `PQ-VPN-Root-CA` (from `ca/pq-vpn-root-ca.crt`) as a trusted root, then add an **IKEv2** VPN with
-server = remote ID = the server's IP and a username login. On Windows, also run:
-
-```powershell
-Set-VpnConnectionIPsecConfiguration -ConnectionName '<Server name>' -Force `
-  -EncryptionMethod AES256 -IntegrityCheckMethod SHA384 -DHGroup ECP384 `
-  -CipherTransformConstants GCMAES256 -AuthenticationTransformConstants GCMAES256 -PfsGroup ECP384
-```
-
-(Windows' default is weak 3DES/SHA-1, which the server refuses.)
-
----
-
-## 7. Everyday commands
-
-Run on a server with `sudo`. They act on **that** server. Run `swanstrap` alone for help.
-
-| I want to… | Command | Where |
-|---|---|---|
-| See servers, users, devices, who's online | `sudo swanstrap list` | any server |
-| Add a username login | `sudo swanstrap add-user alex` | any server |
-| Rebuild someone's files (password kept) | `sudo swanstrap add-user alex` | any server |
-| Give a device access for 30 days | `sudo swanstrap add-device alex-phone ios 30` | CA server |
-| …for another server | `sudo swanstrap add-device alex-phone-fra ios 30 aws-de-fra-01` | CA server |
-| Remove a login | `sudo swanstrap remove alex` | any server |
-| Add a new server | `sudo swanstrap add-server <id> <City> <region> <ip>` | CA server |
-| Save CA + inventory into the repo | `sudo swanstrap sync-kit ~/swanstrap` | CA server |
-| Update strongSwan | `sudo swanstrap upgrade-strongswan` | any server |
-| Check the firewall | `sudo swanstrap firewall` | any server |
-
-- Names: lowercase letters, digits and `-` (e.g. `mom-ipad`).
-- **Username logins** stop working the moment you remove them.
-- **Device logins** can't be revoked: removing one deletes its files, but the certificate keeps working until it
-  expires. Give temporary devices a short lifetime (`… ios 30`).
-
----
-
-## 8. Customizing the setup
-
-### Three ways to run bootstrap
-
-| Mode | Command | Good for |
-|---|---|---|
-| **Quick** | `sudo ./bootstrap.sh --quick` | "Just make it work": detects everything, no questions except the CA passphrase |
-| **Guided** | `sudo ./bootstrap.sh` | Review each detected value; press Enter to keep it or type a new one |
-| **Config file** | `sudo ./bootstrap.sh --config my.env` | Repeatable, scripted setups. Start from `config.example.env` |
-
-Add `--dry-run` to any of them to only **show** what would happen.
-
-### All settings
-
-| Setting | Option | If not given | Default |
-|---|---|---|---|
-| Public IP | `--ip` | cloud metadata → ipify / icanhazip → default route | *(required)* |
-| Provider | `--provider` | hardware info (OCI, AWS, GCP, Azure, DigitalOcean, Hetzner, Vultr, Linode) | `VPS` |
-| Region | `--region` | provider metadata | `unknown` |
-| City / country | `--city` / `--country` | built-in region table, then geo-IP | `Server` / `XX` |
-| Server ID | `--id` | `<provider>-<cc>-<city>-<next nn>` | `vps-xx-ser-01` |
-| Display name | `--name` | `<PROVIDER>-PQ <City>` | `VPS-PQ Server` |
-| Client address pool | `--pool` | next free `10.20.N.0/24` not used by another server or a local network | `10.20.20.0/24` |
-| DNS for clients | `--dns` | | `1.1.1.1, 9.9.9.9` |
-| First username | `--user` | | `personal` |
-| Owner of `~/vpn-clients` | `--client-user` | the user who ran `sudo` | `root` |
-| strongSwan source | `--strongswan auto\|package\|source\|source=6.1.0` | | `auto` |
-| CA | `--new-ca` | restore from `ca/` if present and valid | create new |
-
-Other switches: `--ca-passphrase-file FILE`, `--offline` (no internet lookups), `--no-detect` (defaults only),
-`--yes` (skip confirmation).
-
-```bash
-./bootstrap.sh --quick --dry-run                                   # what would happen here?
-sudo ./bootstrap.sh --quick --new-ca                               # fresh start with a brand-new CA
-sudo ./bootstrap.sh --quick --city Hanoi --country VN --provider home --ip 203.0.113.10
-sudo ./bootstrap.sh --quick --config frankfurt.env --dns 9.9.9.9   # file + one override
-```
-
----
-
-## 9. Security: what is secret and where it lives
-
-| Item | Secret? | Where it lives | If lost |
-|---|---|---|---|
-| **CA passphrase** | 🔴 Yes, the master secret | **Only** in your head / password manager (and temporarily in `CREDENTIALS.txt`) | Can't use the CA again → `--new-ca`, re-set up all devices |
-| CA private key | 🔴 Yes | Repo `ca/` and `/root/vpn-ca/`, **encrypted** with the passphrase (AES-256) | Restored from the repo |
-| CA certificate | 🟢 No (public) | Repo, every server, every device | Restored from the repo |
-| Server private key | 🔴 Yes | Only on that server (`/etc/swanctl/private/`) | Re-run bootstrap / add-server |
-| Username passwords | 🔴 Yes | That server + `CREDENTIALS.txt` | `swanstrap remove` + `add-user` |
-| Device install passwords | 🟠 Yes | `CREDENTIALS.txt` | Issue a new device |
-| Inventory (`servers.tsv`) | 🟢 No | Repo + CA server | Rebuilt by bootstrap |
-
-**Rules of thumb**
-
-- Keep the repo **private**, and keep the passphrase **out of it**.
-- After downloading, delete `~/vpn-clients/CREDENTIALS.txt` (and any bundle `.tar`) from servers.
-- The repo has a **pre-commit hook** (`hooks/`) that refuses to commit passwords, private keys or client files.
-- One device = one certificate. Never share a device file between people.
-- The CA is valid for 10 years. bootstrap warns when less than a year is left and refuses an expired CA.
-
----
-
-## 10. Inside a server
-
-### Network
-
-| What | Value |
+| Concern | Behaviour |
 |---|---|
-| Ports | UDP **500** (IKE), UDP **4500** (IKE/ESP through NAT), ESP |
-| Client addresses | IPv4 from the server's pool (e.g. `10.20.20.0/24`) and IPv6 from `fd20:20:20::/64` |
-| Outgoing traffic | NAT'd to the server's public IP |
-| IPv6 | Tunneled too, so there are no leaks. If the server has IPv6, clients use it; otherwise IPv6 is refused instantly and apps use IPv4 through the VPN |
-| MTU | TCP MSS clamped to 1360 so large pages don't hang |
+| Trust | Every server presents a certificate under the same root, so clients trust all servers once the root is installed |
+| Device certs | Valid on every server; `add-device … <server-id>` renders the client profile for a specific server |
+| User logins | Per server (`add-user` on each) |
+| Shared state | None at runtime. Servers are independent; the inventory matters only for provisioning |
+| Replacing the CA server | `bootstrap.sh` on a new node with the same `ca/` and passphrase. Any node can become the CA server |
 
-### Firewall
+---
 
-- **Normal servers:** `swanstrap-firewall.service` adds the rules at every boot (iptables), placing them before the provider's own
-  "reject everything" rules (e.g. Oracle's).
-- **If `ufw` is active:** the rules are written into ufw's `before.rules` / `before6.rules` instead.
-- **Your cloud provider's firewall** still needs UDP 500/4500 open. swanstrap can't change that.
+## 10. Client provisioning
 
-### Encryption offered by the server
+`swanstrap add-user` / `add-device` write one self-contained artifact per platform to `~/vpn-clients/<Server-Name>/{users,devices}/`.
 
-| Phase | Offered, in order of preference |
-|---|---|
-| IKE (key exchange) | **AES-256-GCM + X25519 + ML-KEM-768** → AES-256-GCM + ECP-384 → AES-256 + SHA-384/256 + ECP-384 → AES-256 + SHA-256 + MODP-2048 (iOS manual setup) |
-| ESP (your traffic) | **AES-256-GCM + X25519 + ML-KEM-768** → AES-256-GCM + ECP-384 → AES-256-GCM → AES-256 + SHA-256 |
+| Artifact | Contents | Effect on the client |
+|---|---|---|
+| `<name>-<Server>.ps1` (user) | Root cert (base64 DER) | Imports the root into `LocalMachine\Root`; `Add-VpnConnection -TunnelType Ikev2 -AuthenticationMethod Eap`; `Set-VpnConnectionIPsecConfiguration` AES256/SHA384/ECP384 + GCMAES256/ECP384 PFS |
+| `<name>-<Server>.ps1` (device) | Root + PKCS#12 | As above, plus imports into `LocalMachine\My`; `-AuthenticationMethod MachineCertificate -AllUserConnection` |
+| `<name>-<Server>.mobileconfig` (user) | `com.apple.security.root` + `com.apple.vpn.managed` | IKEv2, `AuthenticationMethod=None` + `ExtendedAuthEnabled=1` (EAP), IKE/Child SA AES-256-GCM / SHA2-384 / DH 20, PFS |
+| `<name>-<Server>.mobileconfig` (device) | Root + `com.apple.security.pkcs12` + VPN | `AuthenticationMethod=Certificate`, `LocalIdentifier=<name>@pqvpn` |
 
-### Files
+Credentials are appended to `~/vpn-clients/CREDENTIALS.txt`.
+
+**Windows:** `Set-ExecutionPolicy -Scope Process Bypass; .\<file>.ps1` in an elevated PowerShell. Windows' default
+IKEv2 policy (3DES/SHA-1/DH2) is rejected by the server, so the `.ps1` (or the `Set-VpnConnectionIPsecConfiguration` call) is mandatory.
+
+**iOS/macOS:** install the profile, then enable full trust for **PQ-VPN Root CA** (Settings → General → About → Certificate Trust Settings).
+
+**strongSwan clients (PQ):** IKEv2, server = IP, remote ID = IP, CA = `ca/pq-vpn-root-ca.crt`, EAP or certificate.
+They negotiate `ke1_mlkem768` automatically.
+
+---
+
+## 11. CLI reference
+
+`swanstrap` (alias `pqvpn`) runs as root on a server and acts on that server (`/etc/swanstrap/server.conf`).
+
+| Command | Node | Description |
+|---|---|---|
+| `add-user <name>` | any | Create an EAP user (random ~24-char secret) and render the artifacts. Idempotent: rebuilds the files and keeps the secret |
+| `add-device <name> <windows\|ios> [days] [server-id]` | CA | Issue a client cert (prompts for the CA passphrase) and render the artifact for this or another inventory server |
+| `remove <name>` | any | Delete a user (`swanctl --load-creds --clear`) or a device record and artifacts on all servers. The cert stays valid until expiry |
+| `list` | any | Inventory, users, devices with expiry, active IKE SAs |
+| `add-server <id> <City> <region> <ipv4>` | CA | Register, allocate a pool, sign, and build the bundle |
+| `sync-kit <repo-dir>` | CA | Copy `/root/vpn-ca/{crt,key.enc,servers.tsv}` into `<repo>/ca/` |
+| `upgrade-strongswan` | any | Source: rebuild the latest 6.x. Package: `apt --only-upgrade`. Then restart and verify ML-KEM |
+| `firewall` | any | Show the uplink, IPv6 and ufw state and the relevant rules |
+
+Names match `^[a-z0-9-]+$`.
+
+---
+
+## 12. Configuration reference
+
+`bootstrap.sh --config FILE` takes `KEY=value` lines (shell-style quotes allowed, `#` comments, unknown keys rejected).
+Template: `config.example.env`.
+
+| Key | Option | Default | Validation |
+|---|---|---|---|
+| `SERVER_ADDR` | `--ip` | detected | IPv4 |
+| `PROVIDER` | `--provider` | detected / `VPS` | `[A-Z0-9]+` |
+| `REGION` | `--region` | detected / `unknown` | `[A-Za-z0-9._-]+` |
+| `CITY` | `--city` | detected / `Server` | ASCII after transliteration |
+| `COUNTRY` | `--country` | detected / `XX` | ISO 3166 alpha-2 |
+| `SERVER_ID` | `--id` | derived | see §2 |
+| `SERVER_NAME` | `--name` | `<PROVIDER>-PQ <City>` | ASCII, no quotes or commas |
+| `POOL` | `--pool` | next free `10.20.N.0/24` | `10.X.Y.0/24` |
+| `DNS` | `--dns` | `1.1.1.1, 9.9.9.9` | comma-separated IPs |
+| `FIRST_USER` | `--user` | `personal` | `[a-z0-9-]+` |
+| `CLIENT_USER` | `--client-user` | `$SUDO_USER` / `root` | existing user |
+| `STRONGSWAN` | `--strongswan` | `auto` | `auto\|package\|source\|source=X.Y.Z` |
+| `CA_MODE` | `--new-ca` | `auto` | `auto\|restore\|new` |
+| `OFFLINE` | `--offline` | `0` | `1` disables internet lookups |
+
+Flags without a key: `--quick`, `--dry-run`, `--yes`, `--no-detect`, `--ca-passphrase-file FILE`.
+
+---
+
+## 13. Security model
+
+| Asset | Protection | Location | Compromise impact |
+|---|---|---|---|
+| CA passphrase | Never written to the repo or to disk (except `CREDENTIALS.txt` in `--quick` new-CA mode) | Operator | Together with the repo: issue arbitrary server/device certs |
+| CA private key | PKCS#8 AES-256 + PBKDF2 | `ca/`, `/root/vpn-ca` (0600) | Useless without the passphrase |
+| Server leaf key | 0600 root | `/etc/swanctl/private/` on that node | Impersonation of that server only |
+| EAP secrets | 0600 root | `/etc/swanctl/conf.d/pq-vpn-user-*.conf` | That user, that server |
+| Device `.p12` | Random install password | Artifact only (key not kept on the server) | That device until expiry |
+| Bundles | Contain a leaf key | Transient, on the CA server | Delete after install |
+
+Controls:
+
+- `.gitignore`, plus a **pre-commit hook** (`hooks/pre-commit`, enabled via `core.hooksPath`) that rejects `*.key`, `*.p12`,
+  `*.ps1`, `*.mobileconfig`, `*.tar`, `*.env`, `CREDENTIALS*` and any staged unencrypted PEM key or literal `secret = "…"`.
+- Secrets are handled only in tmpfs, shredded on exit, and passed to `openssl` via environment variables (`env:`), never on the
+  command line (which any local user can read from the process list).
+- Downloads are GPG-verified. The vendored source is verified at bootstrap time too.
+- **Known limits:** no revocation (CRL/OCSP); EAP-MSCHAPv2 relies on the outer IKE SA (server-authenticated) for protection;
+  native Windows/iOS clients get no PQ protection; anyone with repo access and the passphrase controls the PKI.
+
+---
+
+## 14. Server layout
 
 | Path | Purpose |
 |---|---|
-| `/etc/swanstrap/server.conf` | This server's identity and settings |
-| `/etc/swanctl/conf.d/pq-vpn.conf` | strongSwan connections (generated from the template) |
-| `/etc/swanctl/conf.d/pq-vpn-user-<name>.conf` | One username login per file |
-| `/etc/swanctl/{x509ca,x509,private}/` | CA certificate, server certificate, server key |
-| `/root/vpn-ca/` | **CA server only**: encrypted CA key, inventory, every issued certificate |
-| `/usr/local/share/swanstrap/` | Installed copy of this kit (the `swanstrap` command lives here) |
-| `/usr/local/src/strongswan/` | strongSwan source build (only when built from source) |
-| `~/vpn-clients/` | Login files, `CREDENTIALS.txt`, this README, `ca-backup/` |
+| `/etc/swanstrap/server.conf` | Node identity + settings (sourced by every tool) |
+| `/etc/swanctl/conf.d/pq-vpn.conf` | Rendered connection config |
+| `/etc/swanctl/conf.d/pq-vpn-user-<name>.conf` | One EAP secret per file (0600) |
+| `/etc/swanctl/{x509ca,x509,private}/` | Root cert, leaf cert, leaf key |
+| `/root/vpn-ca/` | CA server only: `pq-vpn-root-ca.{crt,key.enc}`, `servers.tsv`, `issued/{servers,devices}/` |
+| `/usr/local/share/swanstrap/` | Installed kit; `/usr/local/sbin/{swanstrap,pqvpn}` symlink here |
+| `/usr/local/src/strongswan/` | Source tree, tarballs, `build-<ver>.log` (source mode) |
+| `/var/lib/swanstrap/` | `strongswan` (install mode + version), `latest-version` |
+| `/etc/systemd/system/swanstrap-firewall.service` | Firewall at boot (iptables mode) |
+| `/etc/sysctl.d/99-swanstrap.conf` | Forwarding sysctls |
+| `/etc/update-motd.d/90-swanstrap` | Login warnings: certs expiring < 60 days, newer strongSwan (source mode) |
+| `/etc/cron.weekly/swanstrap-check-release` | Polls download.strongswan.org |
+| `/etc/apt/preferences.d/no-distro-strongswan` | Pin (source mode) |
+| `~<CLIENT_USER>/vpn-clients/` | Artifacts, `CREDENTIALS.txt`, `ca-backup/`, README |
 
-### Services
-
-| Service | Role |
-|---|---|
-| `strongswan` | The VPN daemon (charon) |
-| `swanstrap-firewall` | Re-applies firewall/NAT rules at boot |
-| Login message (`/etc/update-motd.d/90-swanstrap`) | Warns about certificates expiring within 60 days and new strongSwan releases |
-| Weekly job (`/etc/cron.weekly/swanstrap-check-release`) | Checks for new strongSwan releases |
-
----
-
-## 11. Maintenance
-
-| Task | How |
-|---|---|
-| **Update strongSwan** | `sudo swanstrap upgrade-strongswan`. Source builds are rebuilt with the latest release; distro packages are updated through apt. The login message tells you when a new release exists. |
-| **Server's public IP changed** | Re-run `sudo ./bootstrap.sh --quick --id <server-id>` (CA server) or redo `add-server` for others, then reinstall the device files. Reserve a **static IP** to avoid this. |
-| **Certificates expiring** | The login message warns 60 days ahead. Servers: re-run bootstrap / add-server. Devices: issue new ones. |
-| **CA expiring (10 years)** | `sudo ./bootstrap.sh --quick --new-ca`, then give every device its new files. |
-| **Move the CA server** | Bootstrap the new machine from the repo (same passphrase). It becomes the CA server. |
-| **After add-server / add-device** | `sudo swanstrap sync-kit ~/swanstrap`, then commit and push, so the repo stays the source of truth. |
+Services: `strongswan` (or `strongswan-swanctl` with distro packages; detected) and `swanstrap-firewall`.
 
 ---
 
-## 12. Troubleshooting
+## 15. Operations
 
-First, watch the server log while the device connects:
+| Task | Procedure |
+|---|---|
+| Status | `sudo swanstrap list`; `sudo swanctl --list-sas`; `sudo swanctl --list-pools` |
+| Logs | `journalctl -u strongswan -f` |
+| Reload config / creds | `sudo swanctl --load-all` (no SA teardown) |
+| Kick a session | `sudo swanctl --terminate --ike-id <id>` |
+| Verify PQ is offered | `sudo swanctl --list-algs \| grep ML_KEM` |
+| Verify a PQ SA | `sudo swanctl --list-sas`: the IKE SA's key exchange line lists ML-KEM-768 in addition to X25519 |
+| Upgrade strongSwan | `sudo swanstrap upgrade-strongswan` |
+| Re-apply the firewall | `sudo systemctl restart swanstrap-firewall` |
+| Public IP changed | CA server: `sudo ./bootstrap.sh --quick --id <id>` (reissues the cert for the new IP). Member: `add-server` again. Then re-render client artifacts (`add-user`) |
+| Leaf certificates expiring | The login banner warns 60 days ahead. Re-run bootstrap / add-server (servers); issue new device certs (devices) |
+| Root CA rotation | `bootstrap.sh --new-ca`; redeploy artifacts to every client and rebuild member servers |
+| Keep the repo authoritative | `sudo swanstrap sync-kit ~/swanstrap`, then commit and push after `add-server` / `add-device` |
 
-```bash
-sudo journalctl -u strongswan -f
-```
+---
 
-| Symptom | Likely cause | Fix |
+## 16. Troubleshooting
+
+| Symptom (client / `journalctl -u strongswan`) | Cause | Fix |
 |---|---|---|
-| Device times out, nothing in the log | Cloud firewall blocks UDP 500/4500 | Open them in the provider's console |
-| `NO_PROPOSAL_CHOSEN` | Windows still on its weak default encryption | Re-run the `.ps1` (or the command in section 6) |
-| Windows error 13801 / "credentials unacceptable" | CA not in *Local Machine → Trusted Root* | Re-run the `.ps1` as Administrator |
-| iPhone: "Unable to validate server certificate" | CA not trusted | Certificate Trust Settings → **PQ-VPN Root CA** on |
-| `EAP-MSCHAPv2 failed` | Wrong username or password | Check `CREDENTIALS.txt` |
-| Connected but no internet | Firewall/NAT rules missing | `sudo swanstrap firewall`, then `sudo systemctl restart swanstrap-firewall` |
-| Some websites hang | MTU | Check the MSS rule: `sudo iptables -t mangle -S FORWARD` |
-| Stopped working after a server restart | Public IP changed | Reserve a static IP; see Maintenance |
-| bootstrap: "kernel lacks IPsec support" | OpenVZ/LXC or a stripped kernel | Use a KVM / full-VM VPS |
-| bootstrap: "wrong CA passphrase" | Typo or a different CA | Retry; if truly lost, use `--new-ca` |
-| bootstrap: build failed | A newer strongSwan needs new build tools | Log: `/usr/local/src/strongswan/build-*.log`; retry with `--strongswan source=6.1.0` |
-| bootstrap waits at "cloud-init" | First-boot updates still running | Normal; it waits up to 10 minutes |
+| Timeout, nothing logged | UDP 500/4500 blocked upstream | Cloud firewall / security group |
+| `NO_PROPOSAL_CHOSEN` | Client proposals outside the accepted set (Windows defaults) | Run the `.ps1` / `Set-VpnConnectionIPsecConfiguration` |
+| `AUTH_FAILED`, Windows 13801 | Root not in `LocalMachine\Root`, or SAN/EKU mismatch | Re-run the `.ps1` elevated; the server cert must have SAN = the connect address |
+| iOS "Unable to validate server certificate" | Root not fully trusted | Certificate Trust Settings |
+| `EAP_MSCHAPV2 failed` | Wrong secret | `CREDENTIALS.txt`; `add-user` re-renders the files |
+| SA up, no traffic | FORWARD/NAT rules missing, or `ip_forward=0` | `swanstrap firewall`; `sysctl net.ipv4.ip_forward`; restart `swanstrap-firewall` |
+| Large transfers stall | PMTU / MSS | Check the mangle TCPMSS rules |
+| No IPv6 on the client | Server has no v6 uplink (by design: reject) | Expected; IPv4 is used through the tunnel |
+| Bootstrap: kernel lacks IPsec | OpenVZ / LXC / stripped kernel | Use a KVM instance |
+| Bootstrap: build failed | New upstream build deps | `build-<ver>.log`; `--strongswan source=6.1.0` |
+| Bootstrap: wrong CA passphrase | Mismatch | Retry; if lost, use `--new-ca` (PKI rotation) |
 
 ---
 
-## 13. Repository layout
+## 17. Code map and testing
 
 ```
-swanstrap/
-├── bootstrap.sh              Start here: fresh VPS → CA server (--quick | guided | --config | --dry-run)
-├── config.example.env        Every setting, documented
-├── bin/swanstrap             The management command (add-user, add-device, add-server, …)
-├── lib/
-│   ├── common.sh             Shared helpers: validation, pools, inventory, certificates
-│   ├── detect.sh             Provider / region / IP / city detection + region→city table
-│   ├── install.sh            Packages, strongSwan (package or source), files, firewall, service
-│   └── firewall.sh           iptables or ufw rules, NAT, MSS clamp, IPv6 leak protection
-├── templates/
-│   └── pq-vpn.conf.tmpl      The strongSwan connection config, filled in per server
-├── system/                   Login message, release check, firewall service, apt pin
-├── vendor/                   strongSwan 6.1.0 source + signature + release key (offline fallback)
-├── ca/
-│   ├── pq-vpn-root-ca.crt    CA certificate (public)
-│   ├── pq-vpn-root-ca.key.enc CA private key, AES-256 encrypted with your passphrase
-│   └── servers.tsv           Inventory of all servers
-└── hooks/pre-commit          Blocks secrets from being committed
+bootstrap.sh                  entry point: arg/config parsing, resolution, validation, CA, orchestration
+lib/common.sh                 die/warn/step, validators, IPv4 CIDR math, pool allocator, inventory (TSV upsert),
+                              issue_server_cert, new_ca, write_server_conf, render_conf
+lib/detect.sh                 detect_provider (DMI), detect_region / detect_public_ip (per-provider metadata),
+                              region_city (static table), geo_city, ascii (iconv translit)
+lib/install.sh                --base | --prepare | --site DIR | --upgrade-strongswan:
+                              preflight, apt hygiene, strongSwan (package/source), install_kit, install_site,
+                              setup_firewall, start_vpn (verifies conn, key, ML-KEM)
+lib/firewall.sh               apply | status : iptables or ufw, IPv4 + IPv6, sysctls
+bin/swanstrap                 operator CLI; renders .ps1/.mobileconfig; add-server bundling
+templates/pq-vpn.conf.tmpl    swanctl config (@SERVER_ID@ @SERVER_ADDR@ @SERVER_NAME@ @POOL@ @POOL6@ @DNS@)
+system/                       motd, weekly release check, firewall unit, apt pin
+vendor/                       strongSwan 6.1.0 tarball + .sig + release key + configure flags
+ca/                           root cert, encrypted root key, inventory
+hooks/pre-commit              secret scanner
 ```
+
+**Conventions:** `set -euo pipefail`; all mutating operations are idempotent; validation happens before mutation; temp secrets in
+`/run`; no Python or other runtime dependencies beyond coreutils, iproute2, openssl, curl and gettext.
+
+**Testing:** each change is exercised in fresh `--privileged` containers (Ubuntu 22.04/24.04/26.04, Debian 12 with ufw,
+Fedora for refusal), covering new-CA, restore, wrong passphrase, offline build, guided mode (expect), bundle install
+and device issuance. Containers lack systemd, so `install.sh` starts `charon-systemd` directly there.
+Use `--dry-run` for quick plan checks without root.
