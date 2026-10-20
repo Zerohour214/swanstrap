@@ -404,7 +404,7 @@ Windows and Apple native IKEv2 stacks don't implement RFC 9370 / ML-KEM; they ge
 | `ca/` expired, `auto` | New CA (noted in the output). `restore` aborts. |
 | `ca/` < 1 year left | Warning |
 | `ca/` unreadable | Abort. Never silently treated as expired. |
-| `--new-ca` | New RSA-4096 root, overwriting `ca/` (the old CA stays in git history). Passphrase: prompted twice (guided), `--ca-passphrase-file`, or generated (`--quick`, printed once and written to `CREDENTIALS.txt`). |
+| `--new-ca` | New RSA-4096 root, overwriting `ca/` (the old CA stays in git history). Passphrase (≥ 20 characters, because the encrypted key is published): prompted twice in guided mode (Enter generates one), `--ca-passphrase-file`, or generated (`--quick`). Generated passphrases are 28 random characters, printed once and written to `CREDENTIALS.txt`. |
 
 ### strongSwan acquisition (`STRONGSWAN=auto`)
 
@@ -469,7 +469,9 @@ charon chooses the connection during IKE_AUTH: if the client omits the AUTH payl
 | Device | RSA-3072 | `days` (default 1825) | `O=PQ-VPN, OU=device, CN=<name>@pqvpn`; SAN `email:<name>@pqvpn` | `clientAuth` |
 
 - Signatures: SHA-384 with RSA. `notBefore` is back-dated 24 h to tolerate client clock skew.
-- The CA key at rest is PKCS#8 `ENCRYPTED PRIVATE KEY` (PBKDF2-HMAC-SHA256 + AES-256-CBC). It's decrypted only into tmpfs for signing, then shredded.
+- The CA key at rest is PKCS#8 `ENCRYPTED PRIVATE KEY` (AES-256-CBC, PBKDF2-HMAC-SHA256 at **1,000,000 iterations** for CAs created
+  by current versions; OpenSSL's default is 2,048). The file is public in this repo, so its strength rests on the passphrase:
+  bootstrap requires ≥ 20 characters and generates 28 random ones by default. It's decrypted only into tmpfs for signing, then shredded.
   Passphrases reach `openssl` via `env:`, never argv.
 - Device bundles are PKCS#12 with `PBE-SHA1-3DES` / MAC SHA-1. That's a deliberate compatibility choice: the format both the Windows and iOS importers accept.
   It's only a transport container, protected by a random install password.
@@ -634,7 +636,8 @@ Flags without a key: `--quick`, `--dry-run`, `--yes`, `--no-detect`, `--ca-passp
 | Asset | Protection | Location | Compromise impact |
 |---|---|---|---|
 | CA passphrase | Never written to the repo or disk (except `CREDENTIALS.txt` in `--quick --new-ca`) | Operator | With the repo: issue arbitrary server/device certs |
-| CA private key | PKCS#8 AES-256 + PBKDF2 | `ca/`, `/root/vpn-ca` (0600) | Useless without the passphrase |
+| CA private key | PKCS#8 AES-256 + PBKDF2 (1M iterations), passphrase ≥ 20 chars | `ca/` (**public**), `/root/vpn-ca` (0600) | Useless without the passphrase; open to offline guessing forever, so never use a short or reused passphrase |
+| Server addresses | Not published: `-` in the repo's `servers.tsv` | Full inventory only on the CA server | n/a |
 | Server leaf key | 0600 root | `/etc/swanctl/private/` on that node | Impersonation of that server only |
 | EAP secrets | 0600 root | `/etc/swanctl/conf.d/pq-vpn-user-*.conf` | That user, that server |
 | Device `.p12` | Random install password | Artifact only (key not kept on the server) | That device until expiry |

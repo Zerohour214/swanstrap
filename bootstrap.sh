@@ -251,11 +251,14 @@ else
   elif [ "$MODE" = quick ]; then CAPW=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-28); GENERATED_PW=$CAPW
   else
     while :; do
-      CAPW=$(read_pass "New CA passphrase (12+ characters): "); p2=$(read_pass "Repeat: ")
-      [ "$CAPW" = "$p2" ] && [ ${#CAPW} -ge 12 ] && break; echo "didn't match or too short"
+      # The encrypted CA key is published in the repo, so the passphrase must resist offline guessing
+      CAPW=$(read_pass "New CA passphrase (20+ characters, or Enter to generate one): ")
+      if [ -z "$CAPW" ]; then CAPW=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-28); GENERATED_PW=$CAPW; break; fi
+      p2=$(read_pass "Repeat: ")
+      [ "$CAPW" = "$p2" ] && [ ${#CAPW} -ge 20 ] && break; echo "didn't match or shorter than 20 characters"
     done
   fi
-  [ ${#CAPW} -ge 12 ] || die "CA passphrase must be at least 12 characters"
+  [ ${#CAPW} -ge 20 ] || die "CA passphrase must be at least 20 characters (the encrypted CA key is stored in the repo)"
   export CAPW
 fi
 
@@ -275,7 +278,10 @@ install -m 600 "$TMP/ca.crt" $CA/pq-vpn-root-ca.crt
 if [ "$CA_MODE" = restore ]; then   # keep the kit's file byte-identical (re-encrypting changes it)
   install -m 600 "$KCA/pq-vpn-root-ca.key.enc" $CA/pq-vpn-root-ca.key.enc
 else
-  openssl pkey -in "$TMP/ca.key" -aes256 -passout env:CAPW -out $CA/pq-vpn-root-ca.key.enc
+  # PKCS#8 AES-256 with PBKDF2-HMAC-SHA256 at 1,000,000 iterations (openssl's default is 2048):
+  # the file is public, so make every offline guess expensive (~0.4 s per unlock here)
+  openssl pkcs8 -topk8 -in "$TMP/ca.key" -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 1000000 \
+    -passout env:CAPW -out $CA/pq-vpn-root-ca.key.enc
 fi
 inv_upsert "$INV" "$SERVER_ID" "$SERVER_NAME" "$PROVIDER" "$COUNTRY" "$CITY" "$REGION" "$SERVER_ADDR" "$POOL"
 install -m 600 "$INV" $CA/servers.tsv
