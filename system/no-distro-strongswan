@@ -1,0 +1,6 @@
+# strongSwan is built from source by swanstrap (/usr/local/src/strongswan) for ML-KEM.
+# Block distro packages so apt can't overwrite it. Remove this file when switching
+# to a distro package with ML-KEM (swanstrap does this automatically).
+Package: strongswan* charon* libcharon* libstrongswan*
+Pin: release *
+Pin-Priority: -1

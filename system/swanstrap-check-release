@@ -1,0 +1,7 @@
+#!/bin/sh
+# Record the newest strongSwan 6.x release; shown at SSH login by /etc/update-motd.d/90-swanstrap.
+mkdir -p /var/lib/swanstrap
+curl -fsS --max-time 30 https://download.strongswan.org/ |
+  grep -oE 'strongswan-6\.[0-9]+(\.[0-9]+)?\.tar\.bz2' | sed 's/strongswan-//; s/\.tar\.bz2//' |
+  sort -uV | tail -1 > /var/lib/swanstrap/latest.tmp && [ -s /var/lib/swanstrap/latest.tmp ] &&
+  mv /var/lib/swanstrap/latest.tmp /var/lib/swanstrap/latest-version

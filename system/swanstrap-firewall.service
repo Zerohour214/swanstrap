@@ -1,0 +1,14 @@
+[Unit]
+Description=swanstrap VPN firewall rules (IKE/ESP, forwarding, NAT, IPv6 leak protection)
+# After any saved rule sets are restored, so ACCEPTs land before their REJECT rules
+After=network-online.target netfilter-persistent.service ufw.service docker.service
+Wants=network-online.target
+Before=strongswan.service strongswan-swanctl.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/share/swanstrap/lib/firewall.sh apply
+
+[Install]
+WantedBy=multi-user.target

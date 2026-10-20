@@ -1,0 +1,15 @@
+#!/bin/sh
+# swanstrap login warnings: expiring certificates and new strongSwan releases.
+for c in /etc/swanctl/x509ca/*.crt /etc/swanctl/x509/*.crt /root/vpn-ca/issued/*/*.crt; do
+  [ -f "$c" ] || continue
+  openssl x509 -in "$c" -noout -checkend 5184000 >/dev/null 2>&1 ||
+    echo "swanstrap: certificate $c expires $(openssl x509 -in "$c" -noout -enddate | cut -d= -f2)"
+done
+mode=$(cut -d' ' -f1 /var/lib/swanstrap/strongswan 2>/dev/null)
+[ "$mode" = source ] || exit 0          # distro packages get updates through apt
+installed=$(swanctl --version 2>/dev/null | awk '{print $NF}')
+latest=$(cat /var/lib/swanstrap/latest-version 2>/dev/null)
+if [ -n "$latest" ] && [ -n "$installed" ] && [ "$latest" != "$installed" ] &&
+   [ "$(printf '%s\n%s\n' "$installed" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+  echo "swanstrap: strongSwan $latest released (installed $installed). Upgrade: sudo swanstrap upgrade-strongswan"
+fi

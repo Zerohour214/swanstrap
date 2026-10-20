@@ -1,0 +1,294 @@
+#!/bin/bash
+# swanstrap - manage the PQ-VPN on THIS server (identity: /etc/swanstrap/server.conf)
+#
+#   swanstrap add-user   <name>                        username/password login
+#   swanstrap add-device <name> <windows|ios> [days] [server-id]
+#                                                      certificate login (CA server; asks CA passphrase);
+#                                                      the file is for server-id (default: this server)
+#   swanstrap remove     <name>                        delete a user or device and its files
+#   swanstrap list                                     servers, users, devices, who is connected
+#   swanstrap add-server <id> <City> <region> <ip>     CA server: bundle to install another server
+#                                                      id = provider-country-city-nn, e.g. aws-de-fra-01
+#   swanstrap sync-kit   <kit-dir>                     CA server: copy CA + inventory into your kit repo
+#   swanstrap upgrade-strongswan                       update strongSwan (source build or apt)
+#   swanstrap firewall                                 show the VPN firewall state
+#
+# Every login produces ONE self-contained file in ~/vpn-clients/<Server-Name>/:
+#   <name>-<Server-Name>.ps1           Windows: run as Administrator (CA [+ cert] embedded)
+#   <name>-<Server-Name>.mobileconfig  iOS/macOS: open and install  (CA [+ cert] embedded)
+# Passwords are appended to ~/vpn-clients/CREDENTIALS.txt.
+set -euo pipefail
+SHARE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+. "$SHARE/lib/common.sh"
+[ -f /etc/swanstrap/server.conf ] || die "this server isn't set up yet (run bootstrap.sh)"
+. /etc/swanstrap/server.conf
+export SERVER_NAME SERVER_ADDR PROVIDER CITY COUNTRY CA_NAME
+CA=/root/vpn-ca; CACRT=/etc/swanctl/x509ca/pq-vpn-root-ca.crt; CONFD=/etc/swanctl/conf.d
+CLIENT_USER=${CLIENT_USER:-root}
+CLIENTS=$(getent passwd "$CLIENT_USER" | cut -d: -f6)/vpn-clients; DIR=${SERVER_NAME// /-}; OUT=$CLIENTS/$DIR
+umask 077
+[ "$(id -u)" = 0 ] || die "run with sudo"
+
+cred() { mkdir -p "$CLIENTS"; echo "[$SERVER_NAME] $*" >> "$CLIENTS/CREDENTIALS.txt"; }
+finish() {
+  [ -d $CA ] && mkdir -p "$CLIENTS/ca-backup" && cp $CA/pq-vpn-root-ca.key.enc $CA/servers.tsv "$CLIENTS/ca-backup/"
+  chown -R "$CLIENT_USER": "$CLIENTS"; chmod -R go-rwx "$CLIENTS"
+}
+valid_name() { [[ $1 =~ ^[a-z0-9-]+$ ]] || die "name: lowercase letters, digits and - only"; }
+uuid() { cat /proc/sys/kernel/random/uuid; }
+# Decrypt the CA key into tmpfs ($TMP/ca.key); everything in $TMP is shredded on exit.
+unlock_ca() {
+  [ -f $CA/pq-vpn-root-ca.key.enc ] || die "CA key not on this server; run this on the CA server"
+  TMP=$(mktemp -d /run/swanstrap.XXXXXX); trap 'find "$TMP" -type f -exec shred -u {} +; rm -rf "$TMP"' EXIT
+  read -rsp "CA passphrase: " CAPW; echo
+  openssl pkey -in $CA/pq-vpn-root-ca.key.enc -passin "pass:$CAPW" -out "$TMP/ca.key" 2>/dev/null || die "wrong CA passphrase"
+}
+
+# Windows installer. Uses: LOGIN (eap|cert), CA_B64, P12_B64
+windows_ps1() {
+  export CA_B64 P12_B64 LOGIN_DESC
+  {
+    envsubst '$SERVER_NAME $SERVER_ADDR $PROVIDER $CITY $COUNTRY $LOGIN_DESC $CA_B64' <<'EOF'
+# $SERVER_NAME  ($PROVIDER, $CITY $COUNTRY, $SERVER_ADDR) - $LOGIN_DESC
+# Run from an Administrator PowerShell in this folder:
+#   Set-ExecutionPolicy -Scope Process Bypass; .\<this file>
+$ErrorActionPreference = 'Stop'
+$name = '$SERVER_NAME'
+$ca = "$env:TEMP\pq-vpn-root-ca.cer"
+[IO.File]::WriteAllBytes($ca, [Convert]::FromBase64String('$CA_B64'))
+Import-Certificate -FilePath $ca -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+Remove-Item $ca
+EOF
+    if [ "$LOGIN" = cert ]; then
+      envsubst '$P12_B64' <<'EOF'
+$p12 = "$env:TEMP\pq-vpn-client.p12"
+[IO.File]::WriteAllBytes($p12, [Convert]::FromBase64String('$P12_B64'))
+$pw = Read-Host -AsSecureString 'Certificate password'
+try { Import-PfxCertificate -FilePath $p12 -CertStoreLocation Cert:\LocalMachine\My -Password $pw | Out-Null }
+finally { Remove-Item $p12 }
+Remove-VpnConnection -Name $name -AllUserConnection -Force -ErrorAction SilentlyContinue
+EOF
+      echo "\$scope = @{ AllUserConnection = \$true }; \$login = @{ AuthenticationMethod = 'MachineCertificate' }"
+    else
+      echo "Remove-VpnConnection -Name \$name -Force -ErrorAction SilentlyContinue"
+      echo "\$scope = @{}; \$login = @{ AuthenticationMethod = 'Eap'; RememberCredential = \$true }"
+    fi
+    envsubst '$SERVER_ADDR' <<'EOF'
+Add-VpnConnection -Name $name -ServerAddress '$SERVER_ADDR' -TunnelType Ikev2 -EncryptionLevel Maximum -Force @scope @login
+# Windows defaults to weak 3DES/SHA1/DH2; force strong algorithms matching the server.
+Set-VpnConnectionIPsecConfiguration -ConnectionName $name -Force @scope `
+  -EncryptionMethod AES256 -IntegrityCheckMethod SHA384 -DHGroup ECP384 `
+  -CipherTransformConstants GCMAES256 -AuthenticationTransformConstants GCMAES256 -PfsGroup ECP384
+Write-Host "Done. Settings > Network & internet > VPN > $name > Connect"
+EOF
+  }
+}
+
+# iOS/macOS profile. Uses: NAME, LOGIN (eap|cert), CA_B64, P12_B64
+ios_profile() {
+  local sa='<key>EncryptionAlgorithm</key><string>AES-256-GCM</string>
+          <key>IntegrityAlgorithm</key><string>SHA2-384</string>
+          <key>DiffieHellmanGroup</key><integer>20</integer>' p12_uuid=$(uuid) id="pqvpn.$SERVER_ID.$NAME"
+  local cert_payload="" auth
+  if [ "$LOGIN" = cert ]; then
+    cert_payload="
+    <dict>
+      <key>PayloadType</key><string>com.apple.security.pkcs12</string>
+      <key>PayloadIdentifier</key><string>$id.client</string>
+      <key>PayloadUUID</key><string>$p12_uuid</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>PayloadDisplayName</key><string>PQ-VPN client certificate ($NAME)</string>
+      <key>PayloadContent</key><data>$P12_B64</data>
+    </dict>"
+    auth="<key>AuthenticationMethod</key><string>Certificate</string>
+        <key>CertificateType</key><string>RSA</string>
+        <key>PayloadCertificateUUID</key><string>$p12_uuid</string>
+        <key>LocalIdentifier</key><string>$NAME@pqvpn</string>
+        <key>ExtendedAuthEnabled</key><integer>0</integer>"
+  else
+    auth="<key>AuthenticationMethod</key><string>None</string>
+        <key>ExtendedAuthEnabled</key><integer>1</integer>
+        <key>AuthName</key><string>$NAME</string>
+        <key>LocalIdentifier</key><string>$NAME</string>"
+  fi
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadDisplayName</key><string>$SERVER_NAME ($NAME)</string>
+  <key>PayloadIdentifier</key><string>$id</string>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadUUID</key><string>$(uuid)</string>
+  <key>PayloadVersion</key><integer>1</integer>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key><string>com.apple.security.root</string>
+      <key>PayloadIdentifier</key><string>pqvpn.root-ca</string>
+      <key>PayloadUUID</key><string>$(uuid)</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>PayloadDisplayName</key><string>$CA_NAME</string>
+      <key>PayloadContent</key><data>$CA_B64</data>
+    </dict>$cert_payload
+    <dict>
+      <key>PayloadType</key><string>com.apple.vpn.managed</string>
+      <key>PayloadIdentifier</key><string>$id.vpn</string>
+      <key>PayloadUUID</key><string>$(uuid)</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>PayloadDisplayName</key><string>$SERVER_NAME</string>
+      <key>UserDefinedName</key><string>$SERVER_NAME</string>
+      <key>VPNType</key><string>IKEv2</string>
+      <key>IKEv2</key>
+      <dict>
+        <key>RemoteAddress</key><string>$SERVER_ADDR</string>
+        <key>RemoteIdentifier</key><string>$SERVER_ADDR</string>
+        $auth
+        <key>ServerCertificateIssuerCommonName</key><string>$CA_NAME</string>
+        <key>EnablePFS</key><integer>1</integer>
+        <key>DeadPeerDetectionRate</key><string>Medium</string>
+        <key>IKESecurityAssociationParameters</key>
+        <dict>
+          $sa
+          <key>LifeTimeInMinutes</key><integer>1440</integer>
+        </dict>
+        <key>ChildSecurityAssociationParameters</key>
+        <dict>
+          $sa
+          <key>LifeTimeInMinutes</key><integer>480</integer>
+        </dict>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>
+EOF
+}
+
+CA_B64=$(openssl x509 -in $CACRT -outform der | base64 -w0); P12_B64=""
+cmd=${1:-}; shift || true
+case $cmd in
+add-user)
+  NAME=${1:?usage: swanstrap add-user <name>}; valid_name "$NAME"
+  f=$CONFD/pq-vpn-user-$NAME.conf
+  if [ -f "$f" ]; then
+    echo "$NAME exists: rebuilding install files, password unchanged"
+  else
+    pw=$(openssl rand -base64 18 | tr -d '/+=')
+    printf 'secrets {\n  eap-%s {\n    id = %s\n    secret = "%s"\n  }\n}\n' "$NAME" "$NAME" "$pw" > "$f"
+    swanctl --load-creds >/dev/null
+    cred "user $NAME  password: $pw"
+  fi
+  LOGIN=eap; LOGIN_DESC="username login ($NAME)"
+  mkdir -p "$OUT/users"
+  windows_ps1 > "$OUT/users/$NAME-$DIR.ps1"
+  ios_profile > "$OUT/users/$NAME-$DIR.mobileconfig"
+  finish; echo "Files: $OUT/users/$NAME-$DIR.{ps1,mobileconfig}" ;;
+
+add-device)
+  NAME=${1:?usage: swanstrap add-device <name> <windows|ios> [days] [server-id]}; TYPE=${2:?type: windows or ios}; DAYS=${3:-1825}
+  valid_name "$NAME"; [[ $TYPE =~ ^(windows|ios)$ ]] || die "type must be windows or ios"
+  [[ $DAYS =~ ^[0-9]+$ ]] || die "days must be a number"
+  # Optional target server: build the install file for another server in the inventory
+  if [ -n "${4:-}" ] && [ "$4" != "$SERVER_ID" ]; then
+    row=$(inv_get $CA/servers.tsv "$4")
+    [ -n "$row" ] || die "unknown server-id $4 (see: swanstrap list)"
+    IFS=$'\t' read -r SERVER_ID SERVER_NAME PROVIDER COUNTRY CITY _ SERVER_ADDR _ _ <<< "$row"
+    DIR=${SERVER_NAME// /-}; OUT=$CLIENTS/$DIR
+  fi
+  ISSUED=$CA/issued/devices/$NAME.crt; [ -e "$ISSUED" ] && die "$NAME already issued (swanstrap remove $NAME first)"
+  unlock_ca
+  pki --gen --type rsa --size 3072 --outform pem > "$TMP/client.key"
+  pki --req --type priv --in "$TMP/client.key" --dn "O=PQ-VPN, OU=device, CN=$NAME@pqvpn" --san "$NAME@pqvpn" --outform pem |
+    pki --issue --cacert $CACRT --cakey "$TMP/ca.key" --type pkcs10 --not-before "$(not_before)" --lifetime "$DAYS" \
+      --flag clientAuth --outform pem > "$ISSUED"
+  pw=$(openssl rand -base64 12 | tr -d '/+=')
+  # 3DES/SHA1 PKCS#12 encoding: the most widely accepted by Windows and iOS importers
+  P12_B64=$(openssl pkcs12 -export -inkey "$TMP/client.key" -in "$ISSUED" -certfile $CACRT -name "PQ-VPN $NAME" \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -passout "pass:$pw" | base64 -w0)
+  LOGIN=cert; LOGIN_DESC="certificate login ($NAME)"
+  mkdir -p "$OUT/devices"
+  if [ "$TYPE" = windows ]; then file=$OUT/devices/$NAME-$DIR.ps1; windows_ps1 > "$file"
+  else file=$OUT/devices/$NAME-$DIR.mobileconfig; ios_profile > "$file"; fi
+  cred "device $NAME ($TYPE, until $(date -d "+$DAYS days" +%F))  install password: $pw"
+  finish; echo "File: $file" ;;
+
+add-server)
+  ID=${1:-}; NCITY=${2:-}; NREGION=${3:-}; NADDR=${4:-}
+  [ -n "$NADDR" ] || die "usage: swanstrap add-server <provider-cc-city-nn> <City> <region> <public-ip>"
+  valid_id "$ID" || die "id must look like aws-de-fra-01 (provider-country-city-nn)"
+  valid_text "$NCITY" || die "City: ASCII letters, digits, spaces, . ' - only"
+  valid_ipv4 "$NADDR" || die "public-ip must be an IPv4 address"
+  INV=$CA/servers.tsv; [ -f $INV ] || die "no server inventory; run this on the CA server"
+  IFS=- read -r p c _ _ <<< "$ID"
+  N_PROVIDER=${p^^} N_COUNTRY=${c^^} N_NAME="${p^^}-PQ $NCITY"
+  awk -F'\t' -v i="$ID" -v n="$N_NAME" -v a="$NADDR" \
+    'NR > 1 && ($1 == i || $2 == n || $7 == a) {print "swanstrap: clashes with existing server: " $1 " / " $2 " / " $7; f = 1} END {exit f}' $INV >&2 || exit 1
+  N_POOL=$(next_pool $INV)
+  unlock_ca
+  # Bundle = installed kit + a site/ dir for the new server
+  K=$TMP/swanstrap; mkdir -p "$K/site"
+  tar -C "$SHARE" --exclude=./site -cf - . | tar -C "$K" -xf -
+  (
+    SERVER_ID=$ID SERVER_NAME=$N_NAME PROVIDER=$N_PROVIDER COUNTRY=$N_COUNTRY CITY=$NCITY REGION=$NREGION
+    SERVER_ADDR=$NADDR POOL=$N_POOL DNS=${DNS:-1.1.1.1, 9.9.9.9} FIRST_USER=${FIRST_USER:-personal} CLIENT_USER=auto STRONGSWAN=auto
+    issue_server_cert "$TMP/ca.key" $CACRT "$K/site/$ID.key" $CA/issued/servers/$ID.crt
+    cp $CA/issued/servers/$ID.crt $CACRT "$K/site/"
+    write_server_conf "$K/site/server.conf"
+    render_conf "$SHARE/templates/pq-vpn.conf.tmpl" "$K/site/pq-vpn.conf"
+  )
+  inv_upsert $INV "$ID" "$N_NAME" "$N_PROVIDER" "$N_COUNTRY" "$NCITY" "$NREGION" "$NADDR" "$N_POOL"
+  mkdir -p "$CLIENTS/${N_NAME// /-}"; BUNDLE=$CLIENTS/${N_NAME// /-}/swanstrap-$ID.tar
+  tar -C "$TMP" -cf "$BUNDLE" swanstrap
+  finish
+  cat <<EOF
+Registered $ID  "$N_NAME"  ($NADDR, pool $N_POOL)
+Bundle: $BUNDLE  (contains the server's private key; delete it after installing)
+
+Next steps:
+  1. scp $BUNDLE <user>@$NADDR:
+  2. ssh <user>@$NADDR 'tar xf swanstrap-$ID.tar && sudo ./swanstrap/lib/install.sh && rm -r swanstrap-$ID.tar swanstrap'
+  3. In the cloud firewall for $NADDR allow inbound UDP 500 and UDP 4500.
+  4. Save the updated inventory: sudo swanstrap sync-kit <your swanstrap repo>
+EOF
+  ;;
+
+sync-kit)
+  KITDIR=${1:?usage: swanstrap sync-kit <kit-dir>}; [ -f "$KITDIR/bootstrap.sh" ] || die "$KITDIR is not a swanstrap kit"
+  [ -d $CA ] || die "no CA on this server"
+  mkdir -p "$KITDIR/ca"
+  cp $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc $CA/servers.tsv "$KITDIR/ca/"
+  chown -R --reference="$KITDIR" "$KITDIR/ca"
+  echo "Copied CA (encrypted) + inventory into $KITDIR/ca. Commit and push:"
+  echo "  cd $KITDIR && git add ca && git commit -m 'Update CA inventory' && git push" ;;
+
+remove)
+  NAME=${1:?usage: swanstrap remove <name>}; valid_name "$NAME"; found=
+  if [ -f $CONFD/pq-vpn-user-$NAME.conf ]; then
+    rm $CONFD/pq-vpn-user-$NAME.conf; swanctl --load-creds --clear >/dev/null; found=user
+  fi
+  if [ -f $CA/issued/devices/$NAME.crt ]; then
+    mv $CA/issued/devices/$NAME.crt $CA/issued/devices/.removed-$NAME-$(date +%F).crt; found=device
+  fi
+  [ -n "$found" ] || die "no user or device named $NAME"
+  for d in "$CLIENTS"/*/; do rm -f "$d"*/"$NAME-$(basename "$d")".*; done   # files for every server
+  swanctl --list-sas --raw 2>/dev/null | grep -q "$NAME" && echo "note: $NAME is connected; kick with: swanctl --terminate --ike-id <id>"
+  [ $found = device ] && echo "note: device certs are not revoked (no CRL); the device can still connect until its cert expires"
+  finish; echo "removed $found $NAME" ;;
+
+list)
+  [ -f $CA/servers.tsv ] && { echo "== Servers"; column -t -s$'\t' $CA/servers.tsv; echo; }
+  echo "== Users on $SERVER_NAME"; ls $CONFD/pq-vpn-user-*.conf 2>/dev/null | sed 's|.*pq-vpn-user-||;s|\.conf$||;s/^/  /'
+  if [ -d $CA ]; then
+    echo; echo "== Devices (shared CA, valid on all servers)"
+    for c in $CA/issued/devices/*.crt; do [ -e "$c" ] || continue
+      printf '  %-20s until %s\n' "$(basename "$c" .crt)" "$(openssl x509 -in "$c" -noout -enddate | cut -d= -f2)"; done
+  fi
+  echo; echo "== Connected now"
+  sas=$(swanctl --list-sas 2>/dev/null | grep -E 'remote .*\[' | sed 's/^ */  /' || true)
+  echo "${sas:-  (none)}" ;;
+
+upgrade-strongswan) exec "$SHARE/lib/install.sh" --upgrade-strongswan ;;
+firewall) exec "$SHARE/lib/firewall.sh" status ;;
+*) sed -n '2,20p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

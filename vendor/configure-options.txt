@@ -1,0 +1,15 @@
+--prefix=/usr
+--sysconfdir=/etc
+--enable-ml
+--enable-openssl
+--enable-systemd
+--enable-swanctl
+--enable-eap-identity
+--enable-eap-mschapv2
+--enable-eap-tls
+--enable-eap-dynamic
+--enable-farp
+--enable-dhcp
+--enable-curl
+--disable-stroke
+--with-systemdsystemunitdir=/lib/systemd/system

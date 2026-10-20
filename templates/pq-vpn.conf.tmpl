@@ -1,0 +1,55 @@
+# swanstrap: @SERVER_NAME@ (@SERVER_ID@). Generated from templates/pq-vpn.conf.tmpl.
+#
+# Road-warrior VPN. Proposals are tried in order: hybrid post-quantum first
+# (X25519 + ML-KEM-768, used by strongSwan 6.x clients), then classical
+# fallbacks for built-in Windows / iOS IKEv2 clients, which lack ML-KEM.
+#
+# Two logins share the same settings; charon picks one automatically:
+#   pq-vpn      per-device client certificates  (sudo swanstrap add-device)
+#   pq-vpn-eap  username + password, one file per user: pq-vpn-user-<name>.conf (sudo swanstrap add-user)
+#
+# IPv6 (::/0) is tunneled too, so clients can't leak IPv6 traffic outside the VPN.
+connections {
+  pq-vpn {
+    version = 2
+    local_addrs = %any
+    pools = pq-pool, pq-pool6
+    send_cert = always
+    fragmentation = yes
+    unique = replace
+    dpd_delay = 30s
+    proposals = aes256gcm16-prfsha384-x25519-ke1_mlkem768, aes256gcm16-prfsha384-ecp384, aes256-sha384-ecp384, aes256-sha256-ecp384, aes256-sha256-modp2048
+    local {
+      auth = pubkey
+      certs = @SERVER_ID@.crt
+      id = @SERVER_ADDR@
+    }
+    remote {
+      auth = pubkey
+      cacerts = pq-vpn-root-ca.crt
+    }
+    children {
+      net {
+        local_ts = 0.0.0.0/0, ::/0
+        esp_proposals = aes256gcm16-x25519-ke1_mlkem768, aes256gcm16-ecp384, aes256gcm16, aes256-sha256
+        dpd_action = clear
+      }
+    }
+  }
+  pq-vpn-eap : connections.pq-vpn {
+    remote {
+      auth = eap-mschapv2
+      eap_id = %any
+      cacerts =
+    }
+  }
+}
+pools {
+  pq-pool {
+    addrs = @POOL@
+    dns = @DNS@
+  }
+  pq-pool6 {
+    addrs = @POOL6@
+  }
+}

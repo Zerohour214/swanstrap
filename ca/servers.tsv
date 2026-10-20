@@ -1,0 +1,2 @@
+id	name	provider	country	city	region	address	pool	added
+oci-sg-sin-01	OCI-PQ Singapore	OCI	SG	Singapore	ap-singapore-1	-	10.20.20.0/24	2026-10-20

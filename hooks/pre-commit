@@ -1,0 +1,17 @@
+#!/bin/sh
+# swanstrap: refuse commits that contain secrets. Enabled by bootstrap.sh
+# (git config core.hooksPath hooks). The encrypted CA key is the only key allowed.
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+bad=$(echo "$files" |
+  grep -E '(^|/)(CREDENTIALS|PASSWORD)|\.(key|p12|pfx|ps1|mobileconfig|tar)$|(^|/)site/|\.env$' |
+  grep -v '^config\.example\.env$')
+# Content: unencrypted private keys, or real (not template) strongSwan secrets
+for f in $(echo "$files" | grep -v '^ca/pq-vpn-root-ca\.key\.enc$'); do
+  git show ":$f" 2>/dev/null | grep -qE -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|secret = "[^"%$]{6,}"' && bad="$bad
+$f (private key or password inside)"
+done
+bad=$(echo "$bad" | sed '/^$/d')
+if [ -n "$bad" ]; then
+  echo "swanstrap pre-commit: refusing to commit secrets:" >&2; echo "$bad" | sed 's/^/  /' >&2
+  exit 1
+fi

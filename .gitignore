@@ -1,0 +1,14 @@
+# Never commit secrets or generated client files. The only key material allowed
+# in this repo is ca/pq-vpn-root-ca.key.enc (AES-256 encrypted).
+CREDENTIALS*
+PASSWORD*
+*.key
+*.p12
+*.pfx
+*.ps1
+*.mobileconfig
+*.tar
+site/
+vpn-clients/
+*.env
+!config.example.env
