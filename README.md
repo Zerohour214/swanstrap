@@ -331,7 +331,7 @@ More: [Troubleshooting (technical)](#25-troubleshooting).
 | **CA server** | The node created by `bootstrap.sh`. Holds `/root/vpn-ca`; the only node that can sign certificates (`add-device`, `add-server`). |
 | **Member server** | A node installed from an `add-server` bundle: has the root cert and its own leaf key, never the CA key. |
 | **Site** | Per-server input to `install.sh`: `server.conf`, `pq-vpn-root-ca.crt`, `<id>.crt`, `<id>.key`, `pq-vpn.conf`. |
-| **Inventory** | `servers.tsv`, the authoritative list of servers. Used for ID numbering, pool allocation and re-IP detection. |
+| **Inventory** | `servers.tsv`, the authoritative list of servers. Used for ID numbering, pool allocation and re-IP detection. Full copy (with IPs) on the CA server; the repo copy omits addresses ([§18](#18-multi-server-operation)). |
 | **Server ID** | `<provider>-<cc>-<city3>-<nn>` (regex `^[a-z0-9]+-[a-z]{2}-[a-z]{3}-[0-9]{2}$`), e.g. `oci-sg-sin-01`. Used for file names and certificate names. |
 | **Display name** | `<PROVIDER>-PQ <City>`, e.g. `OCI-PQ Singapore`. Certificate CN and the VPN name on clients. |
 | **User login** | EAP-MSCHAPv2 credential, scoped to **one server** (`/etc/swanctl/conf.d/pq-vpn-user-<name>.conf`). |
@@ -537,12 +537,17 @@ Windows' default IKEv2 policy (3DES/SHA-1/DH2) is rejected by the server, so the
 
 ## 18. Multi-server operation
 
-### Inventory schema (`ca/servers.tsv`, TSV with header)
+### Inventory schema (`servers.tsv`, TSV with header)
 
 ```
 id  name  provider  country  city  region  address  pool  added
 oci-sg-sin-01  OCI-PQ Singapore  OCI  SG  Singapore  ap-singapore-1  198.51.100.10  10.20.20.0/24  2026-10-20
 ```
+
+**Server addresses are not published.** The CA server keeps the full inventory in `/root/vpn-ca/servers.tsv`;
+the repo copy (`ca/servers.tsv`, written by `bootstrap` and `sync-kit`) has `-` in the `address` column.
+A re-run of bootstrap on the CA server uses the local copy, so it still recognises itself by IP. After rebuilding
+the CA from the repo, `add-device … <server-id>` asks once for that server's IP and stores it locally.
 
 ### Adding a member server
 
@@ -578,7 +583,7 @@ sudo swanstrap sync-kit ~/swanstrap --push
 | `remove <name>` | any | Delete a user (`swanctl --load-creds --clear`) or a device record + artifacts on all servers. The cert stays valid until expiry |
 | `list` | any | Inventory, users, devices with expiry, active IKE SAs |
 | `add-server <id> <City> <region> <ipv4>` | CA | Register, allocate a pool, sign, build the bundle |
-| `sync-kit <repo-dir> [--push]` | CA | Copy `/root/vpn-ca/{crt,key.enc,servers.tsv}` into `<repo>/ca/`. `--push`: commit (only if changed) and push as the repo owner, with their git identity and credentials |
+| `sync-kit <repo-dir> [--push]` | CA | Copy `/root/vpn-ca/{crt,key.enc}` and the inventory **without server addresses** into `<repo>/ca/`. `--push`: commit (only if changed) and push as the repo owner, with their git identity and credentials |
 | `upgrade-strongswan` | any | Source: rebuild the latest 6.x; package: `apt --only-upgrade`. Then restart and verify ML-KEM |
 | `firewall` | any | Uplink / IPv6 / ufw state and the relevant rules |
 

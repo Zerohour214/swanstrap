@@ -194,7 +194,13 @@ add-device)
   if [ -n "${4:-}" ] && [ "$4" != "$SERVER_ID" ]; then
     row=$(inv_get $CA/servers.tsv "$4")
     [ -n "$row" ] || die "unknown server-id $4 (see: swanstrap list)"
-    IFS=$'\t' read -r SERVER_ID SERVER_NAME PROVIDER COUNTRY CITY _ SERVER_ADDR _ _ <<< "$row"
+    IFS=$'\t' read -r SERVER_ID SERVER_NAME PROVIDER COUNTRY CITY REGION SERVER_ADDR POOL _ <<< "$row"
+    if ! valid_ipv4 "$SERVER_ADDR"; then
+      # Address unknown here (the repo copy of the inventory doesn't publish addresses): ask once, remember locally
+      read -rp "Public IP of $SERVER_ID ($SERVER_NAME): " SERVER_ADDR
+      valid_ipv4 "$SERVER_ADDR" || die "not an IPv4 address"
+      inv_upsert $CA/servers.tsv "$SERVER_ID" "$SERVER_NAME" "$PROVIDER" "$COUNTRY" "$CITY" "$REGION" "$SERVER_ADDR" "$POOL"
+    fi
     DIR=${SERVER_NAME// /-}; OUT=$CLIENTS/$DIR
   fi
   ISSUED=$CA/issued/devices/$NAME.crt; [ -e "$ISSUED" ] && die "$NAME already issued (swanstrap remove $NAME first)"
@@ -258,9 +264,10 @@ sync-kit)
   KITDIR=${1:?usage: swanstrap sync-kit <kit-dir> [--push]}; [ -f "$KITDIR/bootstrap.sh" ] || die "$KITDIR is not a swanstrap kit"
   [ -d $CA ] || die "no CA on this server"
   mkdir -p "$KITDIR/ca"
-  cp $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc $CA/servers.tsv "$KITDIR/ca/"
+  cp $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc "$KITDIR/ca/"
+  inv_redact $CA/servers.tsv "$KITDIR/ca/servers.tsv"     # server addresses stay on this server only
   chown -R --reference="$KITDIR" "$KITDIR/ca"
-  echo "Copied CA (encrypted) + inventory into $KITDIR/ca"
+  echo "Copied CA (encrypted) + inventory (without server addresses) into $KITDIR/ca"
   if [ "${2:-}" = --push ]; then
     # Run git as the repo's owner with their HOME, so their git identity and credentials are used
     OWNER=$(stat -c %U "$KITDIR"); OHOME=$(getent passwd "$OWNER" | cut -d: -f6)

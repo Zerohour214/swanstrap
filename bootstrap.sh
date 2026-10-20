@@ -104,7 +104,16 @@ else
   put CA_MODE new "${SRC[CA_MODE]/default/detected}"
 fi
 INV=$(mktemp); trap 'rm -f "$INV"' EXIT
-[ "${VAL[CA_MODE]}" = restore ] && [ -f "$KCA/servers.tsv" ] && cp "$KCA/servers.tsv" "$INV"
+# Inventory: the repo copy has no server addresses; on the CA server itself (re-run) the
+# full local copy is used, so the server is still recognised by its IP.
+if [ "${VAL[CA_MODE]}" = restore ]; then
+  if [ -r /root/vpn-ca/servers.tsv ] && cmp -s "$KCA/pq-vpn-root-ca.crt" /root/vpn-ca/pq-vpn-root-ca.crt 2>/dev/null; then
+    cp /root/vpn-ca/servers.tsv "$INV"
+  elif [ -f "$KCA/servers.tsv" ]; then
+    cp "$KCA/servers.tsv" "$INV"
+    [ "$(id -u)" = 0 ] || CA_NOTE="${CA_NOTE:+$CA_NOTE; }the repo inventory has no server addresses, so this server isn't matched by IP: on the CA server, run the dry run with sudo"
+  fi
+fi
 
 # --- detection + defaults ---------------------------------------------------------------------
 resolve_base() {
@@ -285,7 +294,8 @@ render_conf "$KIT/templates/pq-vpn.conf.tmpl" "$SITE/pq-vpn.conf"
 OWNER=$(stat -c %U "$KIT")
 # A new CA simply overwrites ca/: the replaced CA stays recoverable from git history
 install -d -o "$OWNER" "$KCA"
-install -m 644 -o "$OWNER" $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc $CA/servers.tsv "$KCA/"
+install -m 644 -o "$OWNER" $CA/pq-vpn-root-ca.crt $CA/pq-vpn-root-ca.key.enc "$KCA/"
+inv_redact $CA/servers.tsv "$KCA/servers.tsv" && chown "$OWNER" "$KCA/servers.tsv"   # no addresses in the repo
 [ -d "$KIT/.git" ] && runuser -u "$OWNER" -- git -C "$KIT" config core.hooksPath hooks
 
 HOME_C=$(getent passwd "$CLIENT_USER" | cut -d: -f6)

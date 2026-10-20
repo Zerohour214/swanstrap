@@ -69,6 +69,9 @@ next_nn() {
   die "no free number for $prefix"
 }
 inv_get() { [ -f "$1" ] && awk -F'\t' -v i="$2" 'NR > 1 && $1 == i' "$1"; }
+# The repo's copy of the inventory doesn't publish server addresses (column 7 -> "-");
+# the CA server keeps the full inventory in /root/vpn-ca/servers.tsv.
+inv_redact() { awk -F'\t' 'BEGIN {OFS = FS} NR > 1 {$7 = "-"} {print}' "$1" > "$2"; }
 # Insert or update a server row (keyed by id)
 inv_upsert() {  # inv id name provider country city region address pool
   local inv=$1; shift
